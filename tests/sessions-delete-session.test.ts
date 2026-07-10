@@ -198,10 +198,18 @@ vi.mock("better-sqlite3", () => {
       }
 
       if (this.sql.includes("FROM sessions s")) {
+        const sessions = Array.from(this.store.sessions.values()).sort(
+          (a, b) => b.started_at - a.started_at,
+        );
+        if (args.length === 0) return sessions;
         const [limit, offset] = args.map(Number);
-        return Array.from(this.store.sessions.values())
-          .sort((a, b) => b.started_at - a.started_at)
-          .slice(offset, offset + limit);
+        return sessions.slice(offset, offset + limit);
+      }
+
+      if (this.sql.includes("FROM sessions")) {
+        return Array.from(this.store.sessions.values()).sort(
+          (a, b) => b.started_at - a.started_at,
+        );
       }
 
       if (this.sql.includes("FROM messages")) {

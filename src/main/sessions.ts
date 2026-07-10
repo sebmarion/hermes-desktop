@@ -19,6 +19,10 @@ import {
 } from "./session-continuation-store";
 import { deleteSessionContextFolderForSession } from "./session-context-folder-store";
 import { deleteSessionModelOverrideForSession } from "./session-model-override-store";
+import {
+  buildCompressionLineageProjection,
+  projectCompressionLineages,
+} from "./session-lineage";
 
 // Sentinel prefix used by hermes-agent's hermes_state.py to mark
 // JSON-encoded multimodal content in the messages.content column.
@@ -34,6 +38,8 @@ export interface SessionSummary {
   model: string;
   title: string | null;
   preview: string;
+  lineageRootId?: string;
+  compressionSegmentCount?: number;
 }
 
 export interface SessionMessage {
@@ -264,7 +270,8 @@ export function listSessions(limit = 30, offset = 0): SessionSummary[] {
   const db = getDb();
   if (!db) return [];
 
-  // Simple query without correlated subquery — titles come from session cache
+  // Read lightweight metadata before paginating so compression continuations
+  // cannot occupy multiple slots or straddle page boundaries.
   const rows = db
     .prepare(
       `SELECT
@@ -274,12 +281,14 @@ export function listSessions(limit = 30, offset = 0): SessionSummary[] {
         s.ended_at,
         s.message_count,
         s.model,
-        s.title
+        s.title,
+        s.parent_session_id,
+        s.end_reason,
+        s.model_config
       FROM sessions s
-      ORDER BY s.started_at DESC
-      LIMIT ? OFFSET ?`,
+      ORDER BY s.started_at DESC`,
     )
-    .all(limit, offset) as Array<{
+    .all() as Array<{
     id: string;
     source: string;
     started_at: number;
@@ -287,18 +296,26 @@ export function listSessions(limit = 30, offset = 0): SessionSummary[] {
     message_count: number;
     model: string;
     title: string | null;
+    parent_session_id: string | null;
+    end_reason: string | null;
+    model_config: string | null;
   }>;
 
-  return rows.map((r) => ({
-    id: r.id,
-    source: r.source,
-    startedAt: r.started_at,
-    endedAt: r.ended_at,
-    messageCount: r.message_count,
-    model: r.model || "",
-    title: r.title,
-    preview: "",
-  }));
+  return projectCompressionLineages(
+    rows.map((r) => ({
+      id: r.id,
+      source: r.source,
+      startedAt: r.started_at,
+      endedAt: r.ended_at,
+      messageCount: r.message_count,
+      model: r.model || "",
+      title: r.title,
+      preview: "",
+      parentSessionId: r.parent_session_id,
+      endReason: r.end_reason,
+      modelConfig: r.model_config,
+    })),
+  ).slice(offset, offset + limit);
 }
 
 export function searchSessions(query: string, limit = 20): SearchResult[] {
@@ -327,7 +344,7 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
       .all(
         `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
         `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
-        limit,
+        Math.max(limit * 8, 50),
       ) as Array<{
       session_id: string;
       title: string | null;
@@ -427,10 +444,57 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
       snippet: decodeSearchSnippet(r.content, r.message_id, trimmedQuery),
     }));
 
-    const uniqueRows = dedupeSearchRowsBySession(
-      [...titleMatches, ...ftsRows, ...messageMatches],
-      limit,
+    const lineageRows = db
+      .prepare(
+        `SELECT id, source, started_at, ended_at, message_count, model, title,
+                parent_session_id, end_reason, model_config
+         FROM sessions`,
+      )
+      .all() as Array<{
+      id: string;
+      source: string;
+      started_at: number;
+      ended_at: number | null;
+      message_count: number;
+      model: string;
+      title: string | null;
+      parent_session_id: string | null;
+      end_reason: string | null;
+      model_config: string | null;
+    }>;
+    const lineage = buildCompressionLineageProjection(
+      lineageRows.map((row) => ({
+        id: row.id,
+        source: row.source,
+        startedAt: row.started_at,
+        endedAt: row.ended_at,
+        messageCount: row.message_count,
+        model: row.model || "",
+        title: row.title,
+        parentSessionId: row.parent_session_id,
+        endReason: row.end_reason,
+        modelConfig: row.model_config,
+      })),
     );
+    const canonicalMatches = [
+      ...titleMatches,
+      ...ftsRows,
+      ...messageMatches,
+    ].map((row) => {
+      const canonical = lineage.canonicalBySessionId.get(row.session_id);
+      if (!canonical) return row;
+      return {
+        ...row,
+        session_id: canonical.id,
+        title: canonical.title,
+        started_at: canonical.startedAt || row.started_at,
+        source: canonical.source || row.source,
+        message_count: canonical.messageCount ?? row.message_count,
+        model: canonical.model || row.model,
+      };
+    });
+
+    const uniqueRows = dedupeSearchRowsBySession(canonicalMatches, limit);
     return uniqueRows.map((r) => ({
       sessionId: r.session_id,
       title: r.title,

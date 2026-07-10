@@ -18,6 +18,14 @@ The inline list lazily loads cached sessions in pages as the user scrolls, so th
 
 Session titles in the inline list are constrained to the sidebar width and truncate with ellipses, while the chat section only scrolls vertically. This keeps long generated titles from creating a horizontal scrollbar.
 
+## Compression lineage projection
+
+Compressed conversations remain one visible session even though Hermes stores each continuation segment as a separate database row.
+
+[[src/main/session-lineage.ts#projectCompressionLineages]] collapses only unmarked, same-source children of rows whose `end_reason` is `compression`. The canonical row navigates to the freshest messageful tip while retaining a missing root title or context folder; branches, delegated runs, tool sessions, and cross-source children remain independent. [[src/main/sessions.ts#listSessions]], [[src/main/sessions.ts#searchSessions]], [[src/main/session-cache.ts#syncSessionCache]], and remote/SSH bridges apply the same read-only projection before returning or caching rows, without mutating `state.db`.
+
+The visible message count comes from the selected tip segment, matching modern Hermes session-catalog behavior. Projection happens before local and SSH pagination so hidden parent segments cannot consume page slots.
+
 The native sidebar scrollbar is hidden to avoid layout shifts. [[src/renderer/src/screens/Layout/Layout.tsx#Layout]] measures the chat scroll container and renders an absolutely positioned overlay thumb only while the user is scrolling, so showing or hiding the scrollbar never changes row width.
 
 ## Project grouping

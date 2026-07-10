@@ -93,6 +93,47 @@ describe("remote session REST bridge", () => {
 
         if (
           req.url ===
+          "/api/profiles/sessions?limit=3&offset=0&min_messages=0&archived=exclude&order=recent&profile=all"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "tip",
+                  parent_session_id: "root",
+                  source: "chat",
+                  started_at: 30,
+                  message_count: 5,
+                  model: "test-model",
+                  title: null,
+                },
+                {
+                  id: "root",
+                  source: "chat",
+                  started_at: 10,
+                  message_count: 10,
+                  model: "test-model",
+                  title: "Remote logical conversation",
+                  end_reason: "compression",
+                },
+                {
+                  id: "branch",
+                  parent_session_id: "root",
+                  source: "chat",
+                  started_at: 20,
+                  message_count: 3,
+                  model: "test-model",
+                  title: "Remote branch",
+                  model_config: JSON.stringify({ _branched_from: "root" }),
+                },
+              ],
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
           "/api/profiles/sessions?limit=2&offset=3&min_messages=0&archived=exclude&order=recent&profile=all"
         ) {
           res.end(
@@ -306,7 +347,20 @@ describe("remote session REST bridge", () => {
     ]);
   });
 
-  it("falls back to the legacy session list endpoint for older dashboards", async () => {
+  it("collapses remote compression rows while preserving marked branches", async () => {
+    const sessions = await remoteListSessions(config(), 3, 0);
+
+    expect(sessions.map((session) => session.id)).toEqual(["tip", "branch"]);
+    expect(sessions[0]).toMatchObject({
+      id: "tip",
+      title: "Remote logical conversation",
+      messageCount: 5,
+      lineageRootId: "root",
+      compressionSegmentCount: 2,
+    });
+  });
+
+  it("falls back to the legacy session endpoint", async () => {
     const originalHandler = server.listeners("request")[0];
     server.removeListener("request", originalHandler);
     server.on("request", (req, res) => {

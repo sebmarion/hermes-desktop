@@ -33,6 +33,10 @@ import { parseMemoryLimitsConfig, type MemoryLimits } from "./memory-limits";
 import { t } from "../shared/i18n";
 import { getAppLocale } from "./locale";
 import { HIDDEN_SUBPROCESS_OPTIONS } from "./process-options";
+import {
+  buildCompressionLineageProjection,
+  projectCompressionLineages,
+} from "./session-lineage";
 
 // ── SSH exec core ────────────────────────────────────────────────────────────
 
@@ -1288,36 +1292,53 @@ export async function sshListSessions(
 import sqlite3, json, os, sys
 payload = json.load(sys.stdin)
 profile = payload.get("profile")
-limit = max(1, min(200, int(payload.get("limit") or 30)))
-offset = max(0, int(payload.get("offset") or 0))
 db = os.path.expanduser(f"~/.hermes/profiles/{profile}/state.db" if profile and profile != "default" else "~/.hermes/state.db")
 if not os.path.exists(db):
     print("[]"); sys.exit(0)
 conn = sqlite3.connect(db)
 conn.row_factory = sqlite3.Row
+columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+def optional(name):
+    return name if name in columns else f"NULL AS {name}"
 rows = conn.execute(
-    "SELECT id, source, started_at, ended_at, message_count, model, title "
-    "FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-    (limit, offset)
+    "SELECT id, source, started_at, ended_at, message_count, model, title, "
+    + optional("parent_session_id") + ", "
+    + optional("end_reason") + ", "
+    + optional("model_config")
+    + " FROM sessions ORDER BY started_at DESC"
 ).fetchall()
-result = []
-for r in rows:
-    result.append({
-        "id": r["id"], "source": r["source"] or "cli",
-        "startedAt": r["started_at"], "endedAt": r["ended_at"],
-        "messageCount": r["message_count"] or 0, "model": r["model"] or "",
-        "title": r["title"], "preview": ""
-    })
-print(json.dumps(result))
+print(json.dumps([dict(r) for r in rows]))
 conn.close()
 `;
   try {
-    const out = await sshPython(
-      config,
-      script,
-      pythonJsonInput({ profile, limit, offset }),
-    );
-    return JSON.parse(out.trim() || "[]");
+    const out = await sshPython(config, script, pythonJsonInput({ profile }));
+    const rows = JSON.parse(out.trim() || "[]") as Array<{
+      id: string;
+      source: string | null;
+      started_at: number;
+      ended_at: number | null;
+      message_count: number | null;
+      model: string | null;
+      title: string | null;
+      parent_session_id: string | null;
+      end_reason: string | null;
+      model_config: string | null;
+    }>;
+    return projectCompressionLineages(
+      rows.map((row) => ({
+        id: row.id,
+        source: row.source || "cli",
+        startedAt: row.started_at,
+        endedAt: row.ended_at,
+        messageCount: row.message_count || 0,
+        model: row.model || "",
+        title: row.title,
+        preview: "",
+        parentSessionId: row.parent_session_id,
+        endReason: row.end_reason,
+        modelConfig: row.model_config,
+      })),
+    ).slice(offset, offset + limit);
   } catch {
     return [];
   }
@@ -1586,11 +1607,14 @@ query = payload.get("query") or ""
 limit = max(1, min(200, int(payload.get("limit") or 20)))
 db = os.path.expanduser(f"~/.hermes/profiles/{profile}/state.db" if profile and profile != "default" else "~/.hermes/state.db")
 if not os.path.exists(db):
-    print("[]"); sys.exit(0)
+    print(json.dumps({"matches": [], "sessions": []})); sys.exit(0)
 conn = sqlite3.connect(db)
 conn.row_factory = sqlite3.Row
+columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+def optional(name):
+    return name if name in columns else f"NULL AS {name}"
 try:
-    rows = conn.execute(
+    matches = conn.execute(
         "SELECT s.id, s.title, s.started_at, s.source, s.message_count, s.model, m.content as snippet "
         "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
         "WHERE lower(coalesce(s.title, '')) LIKE lower(?) "
@@ -1599,19 +1623,16 @@ try:
         "ORDER BY s.started_at DESC, m.timestamp ASC, m.id ASC LIMIT ?",
         (f"%{query}%", f"%{query}%", f"%{query}%", max(limit * 8, 50))
     ).fetchall()
-    seen = set()
-    result = []
-    for r in rows:
-        if r["id"] in seen:
-            continue
-        seen.add(r["id"])
-        snippet = r["snippet"] or r["title"] or ("Session " + r["id"][-6:])
-        result.append({"sessionId": r["id"], "title": r["title"], "startedAt": r["started_at"], "source": r["source"] or "cli", "messageCount": r["message_count"] or 0, "model": r["model"] or "", "snippet": snippet[:500]})
-        if len(result) >= limit:
-            break
-    print(json.dumps(result))
-except Exception as e:
-    print("[]")
+    sessions = conn.execute(
+        "SELECT id, title, started_at, source, message_count, model, "
+        + optional("parent_session_id") + ", "
+        + optional("end_reason") + ", "
+        + optional("model_config")
+        + " FROM sessions"
+    ).fetchall()
+    print(json.dumps({"matches": [dict(r) for r in matches], "sessions": [dict(r) for r in sessions]}))
+except Exception:
+    print(json.dumps({"matches": [], "sessions": []}))
 conn.close()
 `;
   try {
@@ -1620,7 +1641,56 @@ conn.close()
       script,
       pythonJsonInput({ profile, query, limit }),
     );
-    return JSON.parse(out.trim() || "[]");
+    type RawSearchRow = {
+      id: string;
+      title: string | null;
+      started_at: number;
+      source: string | null;
+      message_count: number | null;
+      model: string | null;
+      snippet?: string | null;
+      parent_session_id?: string | null;
+      end_reason?: string | null;
+      model_config?: string | null;
+    };
+    const payload = JSON.parse(out.trim() || "{}") as {
+      matches?: RawSearchRow[];
+      sessions?: RawSearchRow[];
+    };
+    const lineage = buildCompressionLineageProjection(
+      (payload.sessions ?? []).map((row) => ({
+        id: row.id,
+        title: row.title,
+        startedAt: row.started_at,
+        source: row.source || "cli",
+        messageCount: row.message_count || 0,
+        model: row.model || "",
+        parentSessionId: row.parent_session_id,
+        endReason: row.end_reason,
+        modelConfig: row.model_config,
+      })),
+    );
+    const seen = new Set<string>();
+    const results: SearchResult[] = [];
+    for (const match of payload.matches ?? []) {
+      const canonical = lineage.canonicalBySessionId.get(match.id);
+      const sessionId = canonical?.id ?? match.id;
+      if (seen.has(sessionId)) continue;
+      seen.add(sessionId);
+      const snippet =
+        match.snippet || match.title || `Session ${match.id.slice(-6)}`;
+      results.push({
+        sessionId,
+        title: canonical?.title ?? match.title,
+        startedAt: canonical?.startedAt ?? match.started_at,
+        source: canonical?.source || match.source || "cli",
+        messageCount: canonical?.messageCount ?? match.message_count ?? 0,
+        model: canonical?.model || match.model || "",
+        snippet: snippet.slice(0, 500),
+      });
+      if (results.length >= limit) break;
+    }
+    return results;
   } catch {
     return [];
   }

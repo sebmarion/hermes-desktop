@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "path";
-import { mkdirSync, rmSync, existsSync, writeFileSync } from "fs";
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "fs";
 
 // vi.hoisted runs before module imports, so we can't reference imported
 // helpers here — use the bare Node modules via require.
@@ -69,6 +69,9 @@ vi.mock("better-sqlite3", () => {
     message_count: number;
     model: string;
     title: string | null;
+    parent_session_id: string | null;
+    end_reason: string | null;
+    model_config: string | null;
   }
 
   interface MessageRow {
@@ -118,7 +121,17 @@ vi.mock("better-sqlite3", () => {
 
     run(...args: unknown[]): { changes: number } {
       if (this.sql.includes("INSERT OR REPLACE INTO sessions")) {
-        const [id, source, startedAt, messageCount, model, title] = args;
+        const [
+          id,
+          source,
+          startedAt,
+          messageCount,
+          model,
+          title,
+          parentSessionId,
+          endReason,
+          modelConfig,
+        ] = args;
         this.store.sessions.set(String(id), {
           id: String(id),
           source: String(source),
@@ -127,6 +140,18 @@ vi.mock("better-sqlite3", () => {
           message_count: Number(messageCount),
           model: String(model),
           title: title === null || title === undefined ? null : String(title),
+          parent_session_id:
+            parentSessionId === null || parentSessionId === undefined
+              ? null
+              : String(parentSessionId),
+          end_reason:
+            endReason === null || endReason === undefined
+              ? null
+              : String(endReason),
+          model_config:
+            modelConfig === null || modelConfig === undefined
+              ? null
+              : String(modelConfig),
         });
         return { changes: 1 };
       }
@@ -244,6 +269,9 @@ function seedDb(
     model?: string;
     title?: string | null;
     firstUserMessage?: string;
+    parent_session_id?: string | null;
+    end_reason?: string | null;
+    model_config?: string | null;
   }>,
 ): void {
   const db = new Database(DB_PATH);
@@ -266,8 +294,10 @@ function seedDb(
     );
   `);
   const insSession = db.prepare(
-    `INSERT OR REPLACE INTO sessions (id, source, started_at, ended_at, message_count, model, title)
-     VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO sessions (
+       id, source, started_at, ended_at, message_count, model, title,
+       parent_session_id, end_reason, model_config
+     ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
   );
   const insMessage = db.prepare(
     `INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)`,
@@ -280,6 +310,9 @@ function seedDb(
       s.message_count ?? 0,
       s.model ?? "gpt-4o",
       s.title ?? null,
+      s.parent_session_id ?? null,
+      s.end_reason ?? null,
+      s.model_config ?? null,
     );
     if (s.firstUserMessage) {
       insMessage.run(s.id, "user", s.firstUserMessage, s.started_at);
@@ -329,6 +362,76 @@ describe("syncSessionCache", () => {
     expect(result[0].title).toContain("RAII");
     expect(result[1].title).toContain("Python decorator");
     expect(existsSync(CACHE_FILE)).toBe(true);
+  });
+
+  it("writes only the canonical tip for a compression lineage", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      {
+        id: "root",
+        started_at: now,
+        message_count: 100,
+        title: "One logical conversation",
+        end_reason: "compression",
+      },
+      {
+        id: "middle",
+        parent_session_id: "root",
+        started_at: now + 10,
+        message_count: 80,
+        end_reason: "compression",
+      },
+      {
+        id: "tip",
+        parent_session_id: "middle",
+        started_at: now + 20,
+        message_count: 60,
+      },
+    ]);
+
+    const result = syncSessionCache();
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      id: "tip",
+      title: "One logical conversation",
+      messageCount: 60,
+      lineageRootId: "root",
+      compressionSegmentCount: 3,
+    });
+    const persisted = JSON.parse(readFileSync(CACHE_FILE, "utf-8")) as {
+      sessions: Array<{ id: string }>;
+    };
+    expect(persisted.sessions.map((session) => session.id)).toEqual(["tip"]);
+  });
+
+  it("keeps a marked branch beside its parent's canonical tip", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      {
+        id: "root",
+        started_at: now,
+        message_count: 10,
+        end_reason: "compression",
+      },
+      {
+        id: "tip",
+        parent_session_id: "root",
+        started_at: now + 10,
+        message_count: 5,
+      },
+      {
+        id: "branch",
+        parent_session_id: "root",
+        started_at: now + 20,
+        message_count: 3,
+        model_config: JSON.stringify({ _branched_from: "root" }),
+      },
+    ]);
+
+    expect(syncSessionCache().map((session) => session.id)).toEqual([
+      "branch",
+      "tip",
+    ]);
   });
 
   it("treats an empty cache with a stale lastSync as a cold cache", () => {

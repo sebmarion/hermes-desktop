@@ -14,6 +14,7 @@ import {
 } from "./sessions";
 import type { Attachment } from "../shared/attachments";
 import { isImageMime, MAX_IMAGE_BYTES } from "../shared/attachments";
+import { projectCompressionLineages } from "./session-lineage";
 
 export interface RemoteSessionConfig {
   remoteUrl: string;
@@ -211,9 +212,40 @@ function sessionTitle(row: RemoteRecord, id: string): string {
   );
 }
 
-function normalizeSessionSummary(row: RemoteRecord): SessionSummary {
+interface RemoteLineageFields {
+  id: string;
+  parentSessionId?: string;
+  endReason?: string;
+  modelConfig?: string;
+}
+
+function lineageFields(row: RemoteRecord): RemoteLineageFields {
+  const id = stringValue(row.id, stringValue(row.session_id));
+  const parentSessionId = nullableString(
+    row.parent_session_id ?? row.parentSessionId,
+  );
+  const endReason = nullableString(row.end_reason ?? row.endReason);
+  const rawModelConfig = row.model_config ?? row.modelConfig;
+  const modelConfig =
+    typeof rawModelConfig === "string"
+      ? rawModelConfig
+      : rawModelConfig && typeof rawModelConfig === "object"
+        ? JSON.stringify(rawModelConfig)
+        : undefined;
+  return {
+    id,
+    ...(parentSessionId ? { parentSessionId } : {}),
+    ...(endReason ? { endReason } : {}),
+    ...(modelConfig ? { modelConfig } : {}),
+  };
+}
+
+function normalizeSessionSummary(
+  row: RemoteRecord,
+): SessionSummary & RemoteLineageFields {
   const id = stringValue(row.id, stringValue(row.session_id));
   return {
+    ...lineageFields(row),
     id,
     source: stringValue(row.source, "chat"),
     startedAt: numberValue(
@@ -231,6 +263,7 @@ function normalizeSessionSummary(row: RemoteRecord): SessionSummary {
 function normalizeCachedSession(row: RemoteRecord): CachedSession {
   const summary = normalizeSessionSummary(row);
   return {
+    ...lineageFields(row),
     id: summary.id,
     title: summary.title ?? sessionTitle(row, summary.id),
     startedAt: summary.startedAt,
@@ -271,7 +304,9 @@ export async function remoteListSessions(
   offset = 0,
 ): Promise<SessionSummary[]> {
   const response = await remoteSessionListPage(config, limit, offset);
-  return sessionsFromResponse(response).map(normalizeSessionSummary);
+  return projectCompressionLineages(
+    sessionsFromResponse(response).map(normalizeSessionSummary),
+  );
 }
 
 export async function remoteListCachedSessions(
@@ -280,7 +315,9 @@ export async function remoteListCachedSessions(
   offset = 0,
 ): Promise<CachedSession[]> {
   const response = await remoteSessionListPage(config, limit, offset);
-  return sessionsFromResponse(response).map(normalizeCachedSession);
+  return projectCompressionLineages(
+    sessionsFromResponse(response).map(normalizeCachedSession),
+  );
 }
 
 export async function remoteSearchSessions(
