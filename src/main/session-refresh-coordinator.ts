@@ -114,7 +114,9 @@ export function createSessionRefreshCoordinator<T>(
 
   const request = (): Promise<T> => {
     if (disposed) {
-      return Promise.reject(new Error("Session refresh coordinator is stopped"));
+      return Promise.reject(
+        new Error("Session refresh coordinator is stopped"),
+      );
     }
 
     const scope = options.getScope();
