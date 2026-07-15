@@ -26,6 +26,11 @@ import type {
 } from "../shared/account";
 import type { AgentSyncResult, AgentSyncStatus } from "../shared/agent-sync";
 import type { GpuPreferenceMode, GpuStatus } from "../shared/gpu";
+import type {
+  SessionCacheRefreshedNotice,
+  SessionRefreshScope,
+} from "../shared/session-refresh";
+import { subscribeToSessionCacheRefreshed } from "./session-refresh";
 
 /**
  * Mirror of the renderer-side `CredentialPoolEntry` ambient type
@@ -990,6 +995,13 @@ const hermesAPI = {
     ipcRenderer.invoke("uninstall-skill", name, profile),
 
   // Session cache (fast local cache with generated titles)
+  getSessionRefreshScope: (): Promise<SessionRefreshScope> =>
+    ipcRenderer.invoke("get-session-refresh-scope"),
+
+  onSessionCacheRefreshed: (
+    callback: (notice: SessionCacheRefreshedNotice) => void,
+  ): (() => void) => subscribeToSessionCacheRefreshed(ipcRenderer, callback),
+
   listCachedSessions: (
     limit?: number,
     offset?: number,

@@ -32,6 +32,10 @@ import type {
 } from "../shared/messaging-platforms";
 import type { ChatToolEvent } from "../shared/chat-stream";
 import type { GpuPreferenceMode, GpuStatus } from "../shared/gpu";
+import type {
+  SessionCacheRefreshedNotice,
+  SessionRefreshScope,
+} from "../shared/session-refresh";
 
 interface ElectronAPI {
   process: {
@@ -748,6 +752,10 @@ interface HermesAPI {
   ) => Promise<{ success: boolean; error?: string }>;
 
   // Session cache
+  getSessionRefreshScope: () => Promise<SessionRefreshScope>;
+  onSessionCacheRefreshed: (
+    callback: (notice: SessionCacheRefreshedNotice) => void,
+  ) => () => void;
   listCachedSessions: (
     limit?: number,
     offset?: number,
