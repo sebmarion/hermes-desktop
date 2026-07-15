@@ -8,6 +8,10 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
+import {
+  sameSessionRefreshScope,
+  type SessionCacheRefreshedNotice,
+} from "../../../../shared/session-refresh";
 import { useI18n } from "../../components/useI18n";
 import {
   ChevronDown,
@@ -32,11 +36,6 @@ interface RecentSession {
 
 // ChatGPT-style paged conversation list under the pinned app navigation.
 export const RECENT_SESSIONS_PAGE_SIZE = 30;
-
-// Re-sync cadence while the list is visible. Deliberately slower than the
-// Sessions screen (30s) — the sidebar is always on screen, so this interval
-// runs for the whole app lifetime when the section is expanded.
-const RECENT_REFRESH_MS = 60_000;
 
 // Minimum gap between event-driven refreshes (focus, session switch) so a
 // burst of focus/blur events doesn't hammer state.db.
@@ -154,7 +153,7 @@ function groupSessionsByWorkspace(sessions: RecentSession[]): {
  * Fetch strategy, cheapest first:
  *  - on open: instant read from the sessions.json cache (no DB), then one
  *    sync against state.db to pick up sessions created since the last sync
- *  - while open: refresh on window focus and on a slow interval, throttled
+ *  - while open: refresh on window focus and main-process cache generations
  *  - closed (collapsed section or icon-only sidebar): zero work, renders null
  */
 const SidebarRecentSessions = memo(function SidebarRecentSessions({
@@ -212,6 +211,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const lastRefreshRef = useRef(0);
+  const loadRequestIdRef = useRef(0);
   const sessionsRef = useRef<RecentSession[]>([]);
   const hasMoreRef = useRef(false);
   const loadingMoreRef = useRef(false);
@@ -273,11 +273,11 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
         title: string;
         contextFolder?: string | null;
       }>,
+      requestedLimit?: number,
     ): void => {
-      const loadedLimit = Math.max(
-        RECENT_SESSIONS_PAGE_SIZE,
-        sessionsRef.current.length,
-      );
+      const loadedLimit =
+        requestedLimit ??
+        Math.max(RECENT_SESSIONS_PAGE_SIZE, sessionsRef.current.length);
       setHasMore(list.length > loadedLimit);
       const next = normalizeRows(list, loadedLimit);
       setSessions((prev) => (sameSessions(prev, next) ? prev : next));
@@ -294,7 +294,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       }>,
     ): void => {
       setHasMore(list.length > RECENT_SESSIONS_PAGE_SIZE);
-      const page = normalizeRows(list);
+      const page = normalizeRows(list, RECENT_SESSIONS_PAGE_SIZE);
       if (page.length === 0) return;
       setSessions((prev) => {
         const seen = new Set(prev.map((s) => s.id));
@@ -313,9 +313,12 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       const now = Date.now();
       if (!force && now - lastRefreshRef.current < REFRESH_THROTTLE_MS) return;
       lastRefreshRef.current = now;
+      const requestId = ++loadRequestIdRef.current;
       try {
         const synced = await window.hermesAPI.syncSessionCache();
-        applyLoadedWindow(synced);
+        if (loadRequestIdRef.current === requestId) {
+          applyLoadedWindow(synced);
+        }
       } catch {
         // keep whatever we had — the list is best-effort UI sugar
       }
@@ -327,12 +330,13 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     if (!open || !hasMoreRef.current || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
+    const requestId = loadRequestIdRef.current;
     try {
       const nextPage = await window.hermesAPI.listCachedSessions(
         RECENT_SESSIONS_PAGE_SIZE + 1,
         sessionsRef.current.length,
       );
-      appendPage(nextPage);
+      if (loadRequestIdRef.current === requestId) appendPage(nextPage);
     } catch {
       // keep the current list; scrolling can retry on the next event
     } finally {
@@ -356,6 +360,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    const requestId = ++loadRequestIdRef.current;
     void (async () => {
       try {
         const cached = await window.hermesAPI.listCachedSessions(
@@ -363,28 +368,35 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
           // another page exists without a separate count query.
           RECENT_SESSIONS_PAGE_SIZE + 1,
         );
-        if (!cancelled) applyFirstPage(cached);
+        if (!cancelled && loadRequestIdRef.current === requestId) {
+          applyFirstPage(cached);
+        }
       } catch {
         /* ignore cache read errors */
       }
       lastRefreshRef.current = Date.now();
       try {
         const synced = await window.hermesAPI.syncSessionCache();
-        if (!cancelled) applyFirstPage(synced);
+        if (!cancelled && loadRequestIdRef.current === requestId) {
+          applyFirstPage(synced);
+        }
       } catch {
         // cache read above already painted something
       }
     })();
     return () => {
       cancelled = true;
+      if (loadRequestIdRef.current === requestId) {
+        loadRequestIdRef.current += 1;
+      }
     };
   }, [open, activeProfile, applyFirstPage]);
 
-  // While open: pick up background sessions (gateway, cron, other devices)
-  // on focus and on a slow timer. No listeners or timers at all when closed.
+  // Focus remains an immediate explicit sync. The five-second background
+  // cadence belongs to Electron main so Chromium can keep throttling an
+  // unfocused or minimized renderer.
   useEffect(() => {
     if (!open) return;
-    const timer = setInterval(() => void refresh(), RECENT_REFRESH_MS);
     const onFocus = (): void => {
       void refresh();
     };
@@ -397,7 +409,6 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       onContextFolderChanged,
     );
     return () => {
-      clearInterval(timer);
       window.removeEventListener("focus", onFocus);
       window.removeEventListener(
         "hermes-session-context-folder-changed",
@@ -405,6 +416,55 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       );
     };
   }, [open, refresh]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const unsubscribe = window.hermesAPI.onSessionCacheRefreshed(
+      (notice: SessionCacheRefreshedNotice) => {
+        if (notice.scope.profile !== activeProfile) return;
+        const requestId = ++loadRequestIdRef.current;
+        void (async () => {
+          try {
+            const currentScope =
+              await window.hermesAPI.getSessionRefreshScope();
+            if (
+              cancelled ||
+              loadRequestIdRef.current !== requestId ||
+              !sameSessionRefreshScope(notice.scope, currentScope)
+            ) {
+              return;
+            }
+
+            const loadedLimit = Math.max(
+              RECENT_SESSIONS_PAGE_SIZE,
+              sessionsRef.current.length,
+            );
+            const rows = await window.hermesAPI.listCachedSessions(
+              loadedLimit + 1,
+              0,
+            );
+            const finalScope = await window.hermesAPI.getSessionRefreshScope();
+            if (
+              cancelled ||
+              loadRequestIdRef.current !== requestId ||
+              !sameSessionRefreshScope(notice.scope, finalScope)
+            ) {
+              return;
+            }
+            applyLoadedWindow(rows, loadedLimit);
+          } catch {
+            // Preserve the rendered window and wait for the next generation.
+          }
+        })();
+      },
+    );
+    return () => {
+      cancelled = true;
+      loadRequestIdRef.current += 1;
+      unsubscribe();
+    };
+  }, [activeProfile, applyLoadedWindow, open]);
 
   useEffect(() => {
     if (!open) return;
