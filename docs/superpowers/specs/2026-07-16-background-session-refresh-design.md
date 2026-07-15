@@ -13,7 +13,7 @@ The existing focus listeners reduce staleness after the user returns, but they d
 The change must provide predictable background synchronization without globally disabling Electron's renderer throttling.
 
 - Refresh the session cache on a five-second cadence while the main window exists.
-- Update both the recent-session sidebar and the full Sessions modal from the same result.
+- Update both the recent-session sidebar and the full Sessions modal from the same successful refresh generation.
 - Continue running when the window is unfocused, occluded, or minimized.
 - Prevent overlapping refresh work when a local database or remote connection is slow.
 - Preserve the currently rendered rows when a refresh fails and retry on the next cadence.
@@ -50,15 +50,17 @@ The coordinator owns the interval, one in-flight refresh promise, a pending-tick
 
 The existing `sync-session-cache` IPC handler's local/remote/SSH routing becomes a reusable function. Both the IPC handler and the coordinator call that function, keeping one canonical routing path.
 
-After a successful refresh, the coordinator sends a `session-cache-refreshed` event containing the normalized cached-session rows to the primary window. The preload bridge exposes a typed subscription with an unsubscribe function.
+Each refresh captures a scope identity derived from the active connection mode, connection configuration generation, and active profile. After a successful refresh, the coordinator rechecks that identity and drops the result when the scope changed while work was in flight.
 
-The sidebar and Sessions modal subscribe to this event and apply the rows through their existing comparison and stale-request guards. Their initial load and focus listeners remain, while their independent 60-second and 30-second renderer intervals are removed.
+For a current result, the coordinator sends a typed `session-cache-refreshed` notice containing the scope identity and a monotonic refresh generation to the primary window. The preload bridge exposes a typed subscription with an unsubscribe function. The notice deliberately does not carry a fixed-size row payload: each consumer reloads the exact window it owns after the canonical sync succeeds.
+
+The sidebar and Sessions modal subscribe to this notice. The sidebar re-reads `max(loaded row count, page size) + 1` rows so it preserves pagination and recomputes `hasMore`; the Sessions modal re-reads its first 50 rows. Their initial load and focus listeners remain, while their independent 60-second and 30-second renderer intervals are removed.
 
 ## Lifecycle
 
 The app lifecycle starts the coordinator after Electron is ready and the primary window has been created.
 
-Ticks skip publication when there is no live primary window. Closing or quitting the app stops the interval, marks the coordinator disposed, and suppresses publication from any refresh that was already in flight. Recreating a macOS window reuses the running coordinator and receives the next scheduled result within five seconds.
+Ticks skip synchronization and publication when there is no live primary window. Closing the last window on macOS leaves the app-owned coordinator running but idle; recreating a window reuses it and receives the next scheduled result within five seconds. Quitting the application stops the interval, marks the coordinator disposed, and suppresses publication from any refresh that was already in flight. On Windows and Linux, closing the last window quits the application and therefore follows the quit path.
 
 ## Data flow
 
@@ -67,15 +69,18 @@ The background refresh follows one path for every connection mode.
 1. The main-process coordinator ticks every 5,000 milliseconds.
 2. It invokes the existing mode-aware session synchronization function.
 3. Local mode synchronizes `state.db` into the desktop session cache; remote and SSH modes use their existing dashboard or fallback paths.
-4. On success, the main process publishes the rows to the renderer.
-5. The sidebar updates its currently loaded window without discarding pagination state.
-6. The Sessions modal updates its visible first page without showing a loading spinner.
+4. On success, the main process verifies that the captured connection/profile scope is still current.
+5. The main process publishes the scoped refresh-generation notice to the renderer.
+6. The sidebar reads its exact loaded window plus one sentinel row, preserving pagination and recomputing `hasMore`.
+7. The Sessions modal reads its visible first page without showing a loading spinner.
 
 ## Concurrency and stale results
 
 The coordinator allows at most one synchronization request at a time.
 
-Multiple interval ticks collapse into one pending follow-up. Renderer consumers ignore results after unmount and retain their existing request-generation checks so an older initial or focus refresh cannot overwrite a newer coordinator result.
+Multiple interval ticks collapse into one pending follow-up. A profile or connection change invalidates the captured scope and schedules an immediate run for the new scope; completion from the old scope is discarded before publication.
+
+Renderer consumers ignore notices after unmount, reject notices whose scope does not match their current profile/connection generation, and increment their request-generation guard before the exact-window read. An older initial, focus, or background read therefore cannot overwrite a newer result.
 
 ## Error handling
 
@@ -90,8 +95,10 @@ The implementation follows test-driven development.
 - Coordinator unit tests use fake timers to prove the 5,000 ms cadence.
 - A slow-refresh test proves ticks never create overlapping requests and at most one follow-up is queued.
 - Disposal tests prove intervals stop and late promises cannot publish.
-- IPC/preload tests prove the typed event subscription and cleanup contract.
-- Sidebar and Sessions tests prove pushed rows are applied while their surfaces are mounted and that the old renderer intervals are gone.
+- Scope tests prove a profile/connection switch discards an old in-flight result and immediately refreshes the new scope.
+- IPC/preload tests prove the typed notice subscription and cleanup contract.
+- Sidebar tests prove a notice reloads the currently loaded page window plus a sentinel row without truncating pagination.
+- Sessions tests prove a notice reloads the first page while mounted and that the old renderer intervals are gone.
 - Existing session, lint, typecheck, and full Vitest suites must remain green.
 
 ## Documentation
