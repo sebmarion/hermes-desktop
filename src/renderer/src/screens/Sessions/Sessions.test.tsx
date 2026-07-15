@@ -94,12 +94,15 @@ function refreshNotice(
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (error: unknown) => void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function sessionSearchResult(
@@ -335,6 +338,48 @@ describe("Sessions tab live refresh (#322)", () => {
     });
     expect(view.container.querySelector(".sessions-loading")).toBeNull();
     expect(screen.getByText("Generation winner")).toBeTruthy();
+  });
+
+  it("lets the initial sync finish when a notice cache read fails", async () => {
+    vi.useRealTimers();
+    const initialSync = deferred<unknown[]>();
+    const failedNotice = deferred<unknown[]>();
+    const api = installHermesAPI();
+    api.syncSessionCache.mockReturnValue(initialSync.promise);
+    api.listCachedSessions.mockReturnValueOnce(failedNotice.promise);
+
+    const view = render(<Sessions {...baseProps} visible={true} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(view.container.querySelector(".sessions-loading")).not.toBeNull();
+
+    await act(async () => {
+      api.emitRefresh(refreshNotice());
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(api.listCachedSessions).toHaveBeenCalledTimes(1);
+    });
+    failedNotice.reject(new Error("temporary cache failure"));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    initialSync.resolve([
+      {
+        id: "initial-winner",
+        title: "Initial winner",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "desktop",
+        messageCount: 1,
+        model: "test-model",
+      },
+    ]);
+    expect(await screen.findByText("Initial winner")).toBeTruthy();
+    expect(view.container.querySelector(".sessions-loading")).toBeNull();
   });
 
   it("clears stale rows and reloads when the connection source changes", async () => {

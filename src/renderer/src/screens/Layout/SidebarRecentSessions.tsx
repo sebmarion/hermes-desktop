@@ -212,6 +212,8 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
   const [deleting, setDeleting] = useState(false);
   const lastRefreshRef = useRef(0);
   const loadRequestIdRef = useRef(0);
+  const noticeRequestIdRef = useRef(0);
+  const paginationGenerationRef = useRef(0);
   const sessionsRef = useRef<RecentSession[]>([]);
   const hasMoreRef = useRef(false);
   const loadingMoreRef = useRef(false);
@@ -331,12 +333,20 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     loadingMoreRef.current = true;
     setLoadingMore(true);
     const requestId = loadRequestIdRef.current;
+    const paginationGeneration = paginationGenerationRef.current;
+    const offset = sessionsRef.current.length;
     try {
       const nextPage = await window.hermesAPI.listCachedSessions(
         RECENT_SESSIONS_PAGE_SIZE + 1,
-        sessionsRef.current.length,
+        offset,
       );
-      if (loadRequestIdRef.current === requestId) appendPage(nextPage);
+      if (
+        loadRequestIdRef.current === requestId &&
+        paginationGenerationRef.current === paginationGeneration
+      ) {
+        paginationGenerationRef.current += 1;
+        appendPage(nextPage);
+      }
     } catch {
       // keep the current list; scrolling can retry on the next event
     } finally {
@@ -361,6 +371,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     if (!open) return;
     let cancelled = false;
     const requestId = ++loadRequestIdRef.current;
+    const paginationGeneration = ++paginationGenerationRef.current;
     void (async () => {
       try {
         const cached = await window.hermesAPI.listCachedSessions(
@@ -388,6 +399,9 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       cancelled = true;
       if (loadRequestIdRef.current === requestId) {
         loadRequestIdRef.current += 1;
+      }
+      if (paginationGenerationRef.current === paginationGeneration) {
+        paginationGenerationRef.current += 1;
       }
     };
   }, [open, activeProfile, applyFirstPage]);
@@ -423,22 +437,26 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     const unsubscribe = window.hermesAPI.onSessionCacheRefreshed(
       (notice: SessionCacheRefreshedNotice) => {
         if (notice.scope.profile !== activeProfile) return;
-        const requestId = ++loadRequestIdRef.current;
+        const requestId = ++noticeRequestIdRef.current;
+        const baseLoadRequestId = loadRequestIdRef.current;
         void (async () => {
           try {
             const currentScope =
               await window.hermesAPI.getSessionRefreshScope();
             if (
               cancelled ||
-              loadRequestIdRef.current !== requestId ||
+              noticeRequestIdRef.current !== requestId ||
+              loadRequestIdRef.current !== baseLoadRequestId ||
               !sameSessionRefreshScope(notice.scope, currentScope)
             ) {
               return;
             }
 
+            const loadedSessionCount = sessionsRef.current.length;
+            const basePaginationGeneration = paginationGenerationRef.current;
             const loadedLimit = Math.max(
               RECENT_SESSIONS_PAGE_SIZE,
-              sessionsRef.current.length,
+              loadedSessionCount,
             );
             const rows = await window.hermesAPI.listCachedSessions(
               loadedLimit + 1,
@@ -447,11 +465,16 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
             const finalScope = await window.hermesAPI.getSessionRefreshScope();
             if (
               cancelled ||
-              loadRequestIdRef.current !== requestId ||
+              noticeRequestIdRef.current !== requestId ||
+              loadRequestIdRef.current !== baseLoadRequestId ||
+              paginationGenerationRef.current !== basePaginationGeneration ||
+              sessionsRef.current.length !== loadedSessionCount ||
               !sameSessionRefreshScope(notice.scope, finalScope)
             ) {
               return;
             }
+            paginationGenerationRef.current += 1;
+            loadRequestIdRef.current += 1;
             applyLoadedWindow(rows, loadedLimit);
           } catch {
             // Preserve the rendered window and wait for the next generation.
@@ -461,7 +484,9 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     );
     return () => {
       cancelled = true;
+      noticeRequestIdRef.current += 1;
       loadRequestIdRef.current += 1;
+      paginationGenerationRef.current += 1;
       unsubscribe();
     };
   }, [activeProfile, applyLoadedWindow, open]);

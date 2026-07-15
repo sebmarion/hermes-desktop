@@ -317,6 +317,7 @@ function Sessions({
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchRequestId = useRef(0);
   const loadRequestId = useRef(0);
+  const noticeRequestId = useRef(0);
   const searchRef = useRef<HTMLInputElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
 
@@ -592,14 +593,16 @@ function Sessions({
     const unsubscribe = window.hermesAPI.onSessionCacheRefreshed(
       (notice: SessionCacheRefreshedNotice) => {
         if (notice.scope.profile !== activeProfile) return;
-        const requestId = ++loadRequestId.current;
+        const requestId = ++noticeRequestId.current;
+        const baseLoadRequestId = loadRequestId.current;
         void (async () => {
           try {
             const currentScope =
               await window.hermesAPI.getSessionRefreshScope();
             if (
               cancelled ||
-              loadRequestId.current !== requestId ||
+              noticeRequestId.current !== requestId ||
+              loadRequestId.current !== baseLoadRequestId ||
               !sameSessionRefreshScope(notice.scope, currentScope)
             ) {
               return;
@@ -609,11 +612,13 @@ function Sessions({
             const finalScope = await window.hermesAPI.getSessionRefreshScope();
             if (
               cancelled ||
-              loadRequestId.current !== requestId ||
+              noticeRequestId.current !== requestId ||
+              loadRequestId.current !== baseLoadRequestId ||
               !sameSessionRefreshScope(notice.scope, finalScope)
             ) {
               return;
             }
+            loadRequestId.current += 1;
             setLoading(false);
             setSessions((previous) =>
               cached.length === 0 && previous.length > 0
@@ -628,6 +633,7 @@ function Sessions({
     );
     return () => {
       cancelled = true;
+      noticeRequestId.current += 1;
       loadRequestId.current += 1;
       unsubscribe();
     };

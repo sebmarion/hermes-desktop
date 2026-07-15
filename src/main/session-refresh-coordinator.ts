@@ -144,6 +144,9 @@ export function createSessionRefreshCoordinator<T>(
       disposed = true;
       if (interval) clearInterval(interval);
       interval = null;
+      const queued = pending;
+      pending = null;
+      queued?.reject(new Error("Session refresh coordinator is stopped"));
     },
 
     request,

@@ -200,4 +200,85 @@ describe("SidebarRecentSessions background refresh", () => {
     expect(screen.getByText("Newest 1")).toBeTruthy();
     expect(screen.queryByText("Older 1")).toBeNull();
   });
+
+  it("does not truncate a page that appends while a notice read is pending", async () => {
+    const sessions = makeSessions(61);
+    const api = installHermesAPI(sessions);
+    const scrollRoot = document.createElement("div");
+    Object.defineProperties(scrollRoot, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+    renderSidebar(scrollRoot);
+    expect(await screen.findByText("Session 30")).toBeTruthy();
+
+    const noticeRows = deferred<TestSession[]>();
+    const nextPage = deferred<TestSession[]>();
+    api.listCachedSessions.mockClear();
+    api.listCachedSessions
+      .mockImplementationOnce(() => noticeRows.promise)
+      .mockImplementationOnce(() => nextPage.promise);
+
+    await act(async () => {
+      api.emitRefresh(refreshNotice());
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.listCachedSessions).toHaveBeenCalledWith(31, 0);
+
+    scrollRoot.scrollTop = 400;
+    await act(async () => {
+      scrollRoot.dispatchEvent(new Event("scroll"));
+    });
+    expect(api.listCachedSessions).toHaveBeenCalledWith(31, 30);
+
+    await act(async () => {
+      nextPage.resolve(sessions.slice(30, 61));
+      await Promise.resolve();
+      noticeRows.resolve(makeSessions(31, "Refreshed"));
+      await Promise.resolve();
+    });
+    expect(await screen.findByText("Session 60")).toBeTruthy();
+    expect(screen.queryByText("Refreshed 1")).toBeNull();
+  });
+
+  it("does not append a stale page after a notice replaces the window", async () => {
+    const sessions = makeSessions(61);
+    const api = installHermesAPI(sessions);
+    const scrollRoot = document.createElement("div");
+    Object.defineProperties(scrollRoot, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+    renderSidebar(scrollRoot);
+    expect(await screen.findByText("Session 30")).toBeTruthy();
+
+    const stalePage = deferred<TestSession[]>();
+    api.listCachedSessions.mockClear();
+    api.listCachedSessions
+      .mockImplementationOnce(() => stalePage.promise)
+      .mockResolvedValueOnce(makeSessions(31, "Refreshed"));
+
+    scrollRoot.scrollTop = 400;
+    await act(async () => {
+      scrollRoot.dispatchEvent(new Event("scroll"));
+      await Promise.resolve();
+    });
+    expect(api.listCachedSessions).toHaveBeenCalledWith(31, 30);
+
+    await act(async () => {
+      api.emitRefresh(refreshNotice());
+    });
+    expect(await screen.findByText("Refreshed 1")).toBeTruthy();
+
+    stalePage.resolve(sessions.slice(30, 61));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Refreshed 1")).toBeTruthy();
+    expect(screen.queryByText("Session 31")).toBeNull();
+  });
 });

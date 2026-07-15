@@ -189,4 +189,30 @@ describe("session refresh coordinator", () => {
     await vi.advanceTimersByTimeAsync(SESSION_REFRESH_INTERVAL_MS * 2);
     expect(refresh).toHaveBeenCalledTimes(1);
   });
+
+  it("rejects a queued different-scope request when stopped", async () => {
+    let scope = localScope("default", 0);
+    const first = deferred<string[]>();
+    const refresh = vi.fn().mockReturnValue(first.promise);
+    const coordinator = createSessionRefreshCoordinator({
+      getScope: () => scope,
+      hasLiveWindow: () => true,
+      refresh,
+      publish: vi.fn(),
+    });
+
+    const oldRequest = coordinator.request();
+    scope = localScope("work", 1);
+    const queuedRequest = coordinator.request();
+    const queuedResult = queuedRequest.catch((error: unknown) => error);
+
+    coordinator.stop();
+    await expect(queuedResult).resolves.toEqual(
+      new Error("Session refresh coordinator is stopped"),
+    );
+
+    first.resolve(["late"]);
+    await expect(oldRequest).resolves.toEqual(["late"]);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
 });

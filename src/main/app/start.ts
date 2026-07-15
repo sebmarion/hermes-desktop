@@ -21,6 +21,12 @@ import {
   syncSessionCacheForCurrentConnection,
 } from "../ipc/register";
 import { createSessionRefreshCoordinator } from "../session-refresh-coordinator";
+import { createSessionRefreshSnapshotStore } from "../session-refresh-snapshot";
+import { listCachedSessions, type CachedSession } from "../session-cache";
+import {
+  sameSessionRefreshScope,
+  type SessionRefreshScope,
+} from "../../shared/session-refresh";
 import { setGatewayPromptParent } from "../gatewayPrompt";
 import { showChatContextMenu } from "./context-menu";
 import { buildMenu } from "./menu";
@@ -35,20 +41,58 @@ let mainWindow: BrowserWindow | null = null;
 const activeRuns = new Map<string, () => void>();
 let connectionGeneration = 0;
 
+const getSessionRefreshScope = (): SessionRefreshScope => ({
+  mode: getPublicConnectionConfig().mode,
+  profile: getActiveProfileNameSync(),
+  connectionGeneration,
+});
+const sessionRefreshSnapshots =
+  createSessionRefreshSnapshotStore<CachedSession>(50);
+
 const sessionRefreshCoordinator = createSessionRefreshCoordinator({
-  getScope: () => ({
-    mode: getPublicConnectionConfig().mode,
-    profile: getActiveProfileNameSync(),
-    connectionGeneration,
-  }),
+  getScope: getSessionRefreshScope,
   hasLiveWindow: () => Boolean(mainWindow && !mainWindow.isDestroyed()),
-  refresh: syncSessionCacheForCurrentConnection,
+  refresh: async (scope) => {
+    const coverageLimit = sessionRefreshSnapshots.desiredLimit(scope);
+    const rows = await syncSessionCacheForCurrentConnection(coverageLimit);
+    sessionRefreshSnapshots.store(scope, coverageLimit, rows);
+    return rows;
+  },
   publish: (notice) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send("session-cache-refreshed", notice);
   },
   logError: (message, error) => console.error(`[sessions] ${message}`, error),
 });
+
+async function listSessionCacheWindow(
+  limit = 50,
+  offset = 0,
+): Promise<CachedSession[]> {
+  let scope = sessionRefreshCoordinator.getCurrentScope();
+  if (scope.mode === "local") return listCachedSessions(limit, offset);
+
+  sessionRefreshSnapshots.recordWindow(scope, limit, offset);
+  let rows = sessionRefreshSnapshots.read(scope, limit, offset);
+  if (rows) return rows;
+
+  // A larger window can join a refresh that already captured a smaller desired
+  // limit. The first await finishes that generation; one follow-up then fetches
+  // the newly recorded coverage, still through the same process-wide gate.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await sessionRefreshCoordinator.request();
+    const currentScope = sessionRefreshCoordinator.getCurrentScope();
+    if (!sameSessionRefreshScope(scope, currentScope)) {
+      scope = currentScope;
+      if (scope.mode === "local") return listCachedSessions(limit, offset);
+      sessionRefreshSnapshots.recordWindow(scope, limit, offset);
+    }
+    rows = sessionRefreshSnapshots.read(scope, limit, offset);
+    if (rows) return rows;
+  }
+
+  throw new Error("Session cache refresh did not cover the requested window");
+}
 
 export function startMainProcess(): void {
   process.on("uncaughtException", (err) => {
@@ -63,6 +107,7 @@ export function startMainProcess(): void {
     activeRuns,
     getMainWindow: () => mainWindow,
     getSessionRefreshScope: sessionRefreshCoordinator.getCurrentScope,
+    listSessionCacheWindow,
     notifyConnectionConfigChanged,
     notifyModelLibraryChanged,
     openExternalUrl,

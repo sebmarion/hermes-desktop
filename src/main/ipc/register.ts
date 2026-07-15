@@ -391,6 +391,10 @@ export interface IpcContext {
   activeRuns: Map<string, () => void>;
   getMainWindow: () => BrowserWindow | null;
   getSessionRefreshScope: () => SessionRefreshScope;
+  listSessionCacheWindow: (
+    limit?: number,
+    offset?: number,
+  ) => Promise<CachedSession[]>;
   notifyConnectionConfigChanged: () => void;
   notifyModelLibraryChanged: () => void;
   openExternalUrl: (rawUrl: unknown) => void;
@@ -605,16 +609,16 @@ async function resolveMediaForSave(src: string): Promise<string> {
   return (await readMediaForCurrentConnection(src)) ?? src;
 }
 
-export async function syncSessionCacheForCurrentConnection(): Promise<
-  CachedSession[]
-> {
+export async function syncSessionCacheForCurrentConnection(
+  limit = 50,
+): Promise<CachedSession[]> {
   const conn = getConnectionConfig();
-  if (conn.mode === "remote") return remoteListCachedSessions(conn, 50);
+  if (conn.mode === "remote") return remoteListCachedSessions(conn, limit);
   if (conn.mode === "ssh" && conn.ssh)
     return withSshDashboardSessions(
       conn,
-      (config) => remoteListCachedSessions(config, 50),
-      () => sshListCachedSessions(conn.ssh, 50),
+      (config) => remoteListCachedSessions(config, limit),
+      () => sshListCachedSessions(conn.ssh, limit),
       activeSshProfile(),
     );
   try {
@@ -654,6 +658,7 @@ export function registerIpcHandlers(context: IpcContext): void {
     activeRuns,
     getMainWindow,
     getSessionRefreshScope,
+    listSessionCacheWindow,
     notifyConnectionConfigChanged,
     notifyModelLibraryChanged,
     openExternalUrl,
@@ -2192,19 +2197,8 @@ export function registerIpcHandlers(context: IpcContext): void {
   // Session cache (fast local cache with generated titles)
   ipcMain.handle(
     "list-cached-sessions",
-    (_event, limit?: number, offset?: number) => {
-      const conn = getConnectionConfig();
-      if (conn.mode === "remote")
-        return remoteListCachedSessions(conn, limit, offset);
-      if (conn.mode === "ssh" && conn.ssh)
-        return withSshDashboardSessions(
-          conn,
-          (config) => remoteListCachedSessions(config, limit, offset),
-          () => sshListCachedSessions(conn.ssh, limit, offset),
-          activeSshProfile(),
-        );
-      return listCachedSessions(limit, offset);
-    },
+    (_event, limit?: number, offset?: number) =>
+      listSessionCacheWindow(limit, offset),
   );
   ipcMain.handle("get-session-refresh-scope", () => getSessionRefreshScope());
   ipcMain.handle("sync-session-cache", () => requestSessionCacheSync());
