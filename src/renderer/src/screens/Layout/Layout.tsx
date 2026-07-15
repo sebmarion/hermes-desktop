@@ -897,6 +897,7 @@ function Layout({
                 }}
                 currentSessionId={currentSessionId}
                 visible={sessionsModalOpen}
+                activeProfile={activeProfile}
               />
             </div>
           </div>

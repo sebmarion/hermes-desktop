@@ -6,6 +6,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SessionCacheRefreshedNotice } from "../../../../shared/session-refresh";
 
 // useI18n needs an I18nProvider; the Sessions tab only uses `t` for labels,
 // so a pass-through mock keeps these tests focused on the refresh behaviour.
@@ -17,12 +18,13 @@ vi.mock("../../components/useI18n", () => ({
   }),
 }));
 
-import Sessions, { SESSIONS_REFRESH_MS } from "./Sessions";
+import Sessions from "./Sessions";
 
 const baseProps = {
   onResumeSession: (): void => {},
   onNewChat: (): void => {},
   currentSessionId: null,
+  activeProfile: "default",
 };
 
 function installHermesAPI(initialSessions: unknown[] = []): {
@@ -32,14 +34,32 @@ function installHermesAPI(initialSessions: unknown[] = []): {
   deleteSession: ReturnType<typeof vi.fn>;
   deleteSessions: ReturnType<typeof vi.fn>;
   emitConnectionConfigChanged: () => void;
+  emitRefresh: (notice: SessionCacheRefreshedNotice) => void;
+  unsubscribeRefresh: ReturnType<typeof vi.fn>;
 } {
   let connectionConfigChanged: (() => void) | null = null;
+  let refreshListener: ((notice: SessionCacheRefreshedNotice) => void) | null =
+    null;
+  const unsubscribeRefresh = vi.fn(() => {
+    refreshListener = null;
+  });
   const api = {
     listCachedSessions: vi.fn().mockResolvedValue(initialSessions),
     syncSessionCache: vi.fn().mockResolvedValue(initialSessions),
     searchSessions: vi.fn().mockResolvedValue([]),
     deleteSession: vi.fn().mockResolvedValue(undefined),
     deleteSessions: vi.fn().mockResolvedValue({ requested: 0, deleted: 0 }),
+    getSessionRefreshScope: vi.fn().mockResolvedValue({
+      mode: "local",
+      profile: "default",
+      connectionGeneration: 0,
+    }),
+    onSessionCacheRefreshed: vi.fn(
+      (callback: (notice: SessionCacheRefreshedNotice) => void) => {
+        refreshListener = callback;
+        return unsubscribeRefresh;
+      },
+    ),
     onConnectionConfigChanged: vi.fn((callback: () => void) => {
       connectionConfigChanged = callback;
       return () => {
@@ -56,7 +76,30 @@ function installHermesAPI(initialSessions: unknown[] = []): {
   return {
     ...api,
     emitConnectionConfigChanged: () => connectionConfigChanged?.(),
+    emitRefresh: (notice) => refreshListener?.(notice),
+    unsubscribeRefresh,
   };
+}
+
+function refreshNotice(
+  profile = "default",
+  generation = 1,
+): SessionCacheRefreshedNotice {
+  return {
+    scope: { mode: "local", profile, connectionGeneration: 0 },
+    generation,
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 function sessionSearchResult(
@@ -98,51 +141,65 @@ describe("Sessions tab live refresh (#322)", () => {
     vi.useRealTimers();
   });
 
-  it("re-syncs from state.db on an interval while the tab is visible", async () => {
+  it("reads the first cached page on a matching notice while visible", async () => {
+    vi.useRealTimers();
     const api = installHermesAPI();
     render(<Sessions {...baseProps} visible={true} />);
     await act(async () => {});
 
     const afterMount = api.syncSessionCache.mock.calls.length;
     expect(afterMount).toBeGreaterThan(0);
+    api.listCachedSessions.mockResolvedValue([
+      {
+        id: "background-session",
+        title: "Background session",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "desktop",
+        messageCount: 1,
+        model: "test-model",
+      },
+    ]);
 
     await act(async () => {
-      vi.advanceTimersByTime(SESSIONS_REFRESH_MS);
+      api.emitRefresh(refreshNotice());
     });
-    expect(api.syncSessionCache.mock.calls.length).toBe(afterMount + 1);
-
-    await act(async () => {
-      vi.advanceTimersByTime(SESSIONS_REFRESH_MS);
+    await waitFor(() => {
+      expect(api.listCachedSessions).toHaveBeenCalledWith(50, 0);
     });
-    expect(api.syncSessionCache.mock.calls.length).toBe(afterMount + 2);
+    expect(api.syncSessionCache).toHaveBeenCalledTimes(afterMount);
+    expect(screen.getByText("Background session")).toBeTruthy();
+    expect(screen.queryByText("sessions.loading")).toBeNull();
   });
 
-  it("runs no timer while the tab is hidden", async () => {
+  it("does no notice work while hidden", async () => {
+    vi.useRealTimers();
     const api = installHermesAPI();
     render(<Sessions {...baseProps} visible={false} />);
     await act(async () => {});
 
-    const afterMount = api.syncSessionCache.mock.calls.length;
+    api.listCachedSessions.mockClear();
     await act(async () => {
-      vi.advanceTimersByTime(SESSIONS_REFRESH_MS * 5);
+      api.emitRefresh(refreshNotice());
+      await Promise.resolve();
     });
-    expect(api.syncSessionCache.mock.calls.length).toBe(afterMount);
+    expect(api.listCachedSessions).not.toHaveBeenCalled();
   });
 
-  it("stops the timer once the tab becomes hidden", async () => {
+  it("ignores mismatched profiles and unsubscribes on unmount", async () => {
+    vi.useRealTimers();
     const api = installHermesAPI();
     const view = render(<Sessions {...baseProps} visible={true} />);
     await act(async () => {});
+    api.listCachedSessions.mockClear();
 
     await act(async () => {
-      view.rerender(<Sessions {...baseProps} visible={false} />);
+      api.emitRefresh(refreshNotice("work"));
+      await Promise.resolve();
     });
-    const afterHide = api.syncSessionCache.mock.calls.length;
+    expect(api.listCachedSessions).not.toHaveBeenCalled();
 
-    await act(async () => {
-      vi.advanceTimersByTime(SESSIONS_REFRESH_MS * 3);
-    });
-    expect(api.syncSessionCache.mock.calls.length).toBe(afterHide);
+    view.unmount();
+    expect(api.unsubscribeRefresh).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes when the window regains focus", async () => {
@@ -158,6 +215,7 @@ describe("Sessions tab live refresh (#322)", () => {
   });
 
   it("keeps visible sessions when a quiet refresh transiently returns empty", async () => {
+    vi.useRealTimers();
     const api = installHermesAPI([
       {
         id: "ssh-session",
@@ -173,14 +231,78 @@ describe("Sessions tab live refresh (#322)", () => {
     await act(async () => {});
     expect(screen.getByText("SSH session")).toBeTruthy();
 
-    api.syncSessionCache.mockResolvedValue([]);
+    api.listCachedSessions.mockResolvedValue([]);
 
     await act(async () => {
-      vi.advanceTimersByTime(SESSIONS_REFRESH_MS);
+      api.emitRefresh(refreshNotice());
     });
 
     expect(screen.getByText("SSH session")).toBeTruthy();
     expect(screen.queryByText("sessions.empty")).toBeNull();
+  });
+
+  it("does not let an older notice read overwrite a newer one", async () => {
+    vi.useRealTimers();
+    const api = installHermesAPI([
+      {
+        id: "initial",
+        title: "Initial session",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "desktop",
+        messageCount: 1,
+        model: "test-model",
+      },
+    ]);
+    render(<Sessions {...baseProps} visible={true} />);
+    expect(await screen.findByText("Initial session")).toBeTruthy();
+
+    const older = deferred<unknown[]>();
+    const newer = deferred<unknown[]>();
+    api.listCachedSessions.mockClear();
+    api.listCachedSessions
+      .mockImplementationOnce(() => older.promise)
+      .mockImplementationOnce(() => newer.promise);
+
+    await act(async () => {
+      api.emitRefresh(refreshNotice("default", 2));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      api.emitRefresh(refreshNotice("default", 3));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.listCachedSessions).toHaveBeenCalledTimes(2);
+
+    newer.resolve([
+      {
+        id: "newest",
+        title: "Newest session",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "desktop",
+        messageCount: 1,
+        model: "test-model",
+      },
+    ]);
+    expect(await screen.findByText("Newest session")).toBeTruthy();
+
+    older.resolve([
+      {
+        id: "older",
+        title: "Older session",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "desktop",
+        messageCount: 1,
+        model: "test-model",
+      },
+    ]);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Newest session")).toBeTruthy();
+    expect(screen.queryByText("Older session")).toBeNull();
   });
 
   it("clears stale rows and reloads when the connection source changes", async () => {

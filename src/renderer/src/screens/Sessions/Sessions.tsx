@@ -1,4 +1,8 @@
 import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
+import {
+  sameSessionRefreshScope,
+  type SessionCacheRefreshedNotice,
+} from "../../../../shared/session-refresh";
 import { Plus, Search, X, ChatBubble, Trash, Pencil } from "../../assets/icons";
 import { useI18n } from "../../components/useI18n";
 
@@ -26,6 +30,7 @@ interface SessionsProps {
   onNewChat: () => void;
   currentSessionId: string | null;
   visible: boolean;
+  activeProfile: string;
 }
 
 function formatTime(ts: number): string {
@@ -282,16 +287,12 @@ const SessionCard = memo(function SessionCard({
   );
 });
 
-// How often the Sessions tab re-syncs from state.db while it is open, so
-// sessions created in the background (cron jobs, gateway platforms, another
-// device) surface without the user navigating away and back. (refs #322)
-export const SESSIONS_REFRESH_MS = 30_000;
-
 function Sessions({
   onResumeSession,
   onNewChat,
   currentSessionId,
   visible,
+  activeProfile,
 }: SessionsProps): React.JSX.Element {
   const { t } = useI18n();
   const [sessions, setSessions] = useState<CachedSession[]>([]);
@@ -571,25 +572,65 @@ function Sessions({
     return unsubscribe;
   }, [loadSessions]);
 
-  // While the Sessions tab is actually showing, periodically re-sync so
-  // sessions created in the background — cron jobs, gateway platforms, or
-  // another device writing the same state.db — surface even if the user
-  // just leaves this tab open. Also refresh when the window regains focus.
-  // Gated on `visible`: no timer and no DB reads while another screen shows.
+  // Keep the focus-triggered explicit sync for immediate foreground recovery.
+  // The five-second cadence lives in Electron main so a minimized renderer can
+  // remain throttled without delaying session synchronization.
   useEffect(() => {
     if (!visible) return;
-    const timer = setInterval(() => {
-      void refreshSessions();
-    }, SESSIONS_REFRESH_MS);
     const onFocus = (): void => {
       void refreshSessions();
     };
     window.addEventListener("focus", onFocus);
     return () => {
-      clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
   }, [visible, refreshSessions]);
+
+  useEffect(() => {
+    if (!visible) return;
+    let cancelled = false;
+    const unsubscribe = window.hermesAPI.onSessionCacheRefreshed(
+      (notice: SessionCacheRefreshedNotice) => {
+        if (notice.scope.profile !== activeProfile) return;
+        const requestId = ++loadRequestId.current;
+        void (async () => {
+          try {
+            const currentScope =
+              await window.hermesAPI.getSessionRefreshScope();
+            if (
+              cancelled ||
+              loadRequestId.current !== requestId ||
+              !sameSessionRefreshScope(notice.scope, currentScope)
+            ) {
+              return;
+            }
+
+            const cached = await window.hermesAPI.listCachedSessions(50, 0);
+            const finalScope = await window.hermesAPI.getSessionRefreshScope();
+            if (
+              cancelled ||
+              loadRequestId.current !== requestId ||
+              !sameSessionRefreshScope(notice.scope, finalScope)
+            ) {
+              return;
+            }
+            setSessions((previous) =>
+              cached.length === 0 && previous.length > 0
+                ? previous
+                : cached.slice(0, 50),
+            );
+          } catch {
+            // Preserve the visible first page and retry on the next generation.
+          }
+        })();
+      },
+    );
+    return () => {
+      cancelled = true;
+      loadRequestId.current += 1;
+      unsubscribe();
+    };
+  }, [activeProfile, visible]);
 
   useEffect(() => {
     if (searchTimer.current) clearTimeout(searchTimer.current);
