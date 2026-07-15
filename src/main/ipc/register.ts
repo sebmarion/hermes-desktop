@@ -19,6 +19,7 @@ import type {
   DesktopSessionContinuationItem,
   DesktopSessionLocalError,
 } from "../../shared/session-continuation";
+import type { SessionRefreshScope } from "../../shared/session-refresh";
 import { stageAttachment, clearStagedAttachments } from "../attachment-staging";
 import { persistPromptImageAttachments } from "../session-attachment-store";
 import {
@@ -187,6 +188,7 @@ import {
   syncSessionCache,
   listCachedSessions,
   updateSessionTitle,
+  type CachedSession,
 } from "../session-cache";
 import {
   remoteDeleteSession,
@@ -388,9 +390,11 @@ import {
 export interface IpcContext {
   activeRuns: Map<string, () => void>;
   getMainWindow: () => BrowserWindow | null;
+  getSessionRefreshScope: () => SessionRefreshScope;
   notifyConnectionConfigChanged: () => void;
   notifyModelLibraryChanged: () => void;
   openExternalUrl: (rawUrl: unknown) => void;
+  requestSessionCacheSync: () => Promise<CachedSession[]>;
 }
 
 const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME?.trim() || "Hermes One";
@@ -601,6 +605,26 @@ async function resolveMediaForSave(src: string): Promise<string> {
   return (await readMediaForCurrentConnection(src)) ?? src;
 }
 
+export async function syncSessionCacheForCurrentConnection(): Promise<
+  CachedSession[]
+> {
+  const conn = getConnectionConfig();
+  if (conn.mode === "remote") return remoteListCachedSessions(conn, 50);
+  if (conn.mode === "ssh" && conn.ssh)
+    return withSshDashboardSessions(
+      conn,
+      (config) => remoteListCachedSessions(config, 50),
+      () => sshListCachedSessions(conn.ssh, 50),
+      activeSshProfile(),
+    );
+  try {
+    return syncSessionCache();
+  } catch (error) {
+    console.error("sync-session-cache failed; using local cache", error);
+    return listCachedSessions(50);
+  }
+}
+
 /**
  * Resolve the saved-model library entry for an activated (provider, model) so
  * its `apiMode`/`contextLength` can be mirrored into config.yaml. When several
@@ -629,9 +653,11 @@ export function registerIpcHandlers(context: IpcContext): void {
   const {
     activeRuns,
     getMainWindow,
+    getSessionRefreshScope,
     notifyConnectionConfigChanged,
     notifyModelLibraryChanged,
     openExternalUrl,
+    requestSessionCacheSync,
   } = context;
   const mainWindow = getMainWindow();
   // Installation
@@ -2180,23 +2206,8 @@ export function registerIpcHandlers(context: IpcContext): void {
       return listCachedSessions(limit, offset);
     },
   );
-  ipcMain.handle("sync-session-cache", () => {
-    const conn = getConnectionConfig();
-    if (conn.mode === "remote") return remoteListCachedSessions(conn, 50);
-    if (conn.mode === "ssh" && conn.ssh)
-      return withSshDashboardSessions(
-        conn,
-        (config) => remoteListCachedSessions(config, 50),
-        () => sshListCachedSessions(conn.ssh, 50),
-        activeSshProfile(),
-      );
-    try {
-      return syncSessionCache();
-    } catch (error) {
-      console.error("sync-session-cache failed; using local cache", error);
-      return listCachedSessions(50);
-    }
-  });
+  ipcMain.handle("get-session-refresh-scope", () => getSessionRefreshScope());
+  ipcMain.handle("sync-session-cache", () => requestSessionCacheSync());
   ipcMain.handle(
     "update-session-title",
     (_event, sessionId: string, title: string) => {

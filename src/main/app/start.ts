@@ -1,13 +1,9 @@
-import {
-  app,
-  BrowserWindow,
-  session,
-  shell,
-} from "electron";
+import { app, BrowserWindow, session, shell } from "electron";
 import { join } from "path";
 import { electronApp, optimizer, is } from "@electron-toolkit/utils";
 import icon from "../../../resources/icon.png?asset";
 import { getPublicConnectionConfig } from "../config";
+import { getActiveProfileNameSync } from "../utils";
 import { stopHealthPolling } from "../hermes";
 import { stopAllDashboards } from "../dashboard";
 import { cleanupTempMediaFiles } from "../media";
@@ -20,7 +16,11 @@ import {
   isAllowedExternalUrl,
   isAllowedWebviewUrl,
 } from "../security";
-import { registerIpcHandlers } from "../ipc/register";
+import {
+  registerIpcHandlers,
+  syncSessionCacheForCurrentConnection,
+} from "../ipc/register";
+import { createSessionRefreshCoordinator } from "../session-refresh-coordinator";
 import { setGatewayPromptParent } from "../gatewayPrompt";
 import { showChatContextMenu } from "./context-menu";
 import { buildMenu } from "./menu";
@@ -33,6 +33,22 @@ const OPEN_DEVTOOLS_ON_START =
 
 let mainWindow: BrowserWindow | null = null;
 const activeRuns = new Map<string, () => void>();
+let connectionGeneration = 0;
+
+const sessionRefreshCoordinator = createSessionRefreshCoordinator({
+  getScope: () => ({
+    mode: getPublicConnectionConfig().mode,
+    profile: getActiveProfileNameSync(),
+    connectionGeneration,
+  }),
+  hasLiveWindow: () => Boolean(mainWindow && !mainWindow.isDestroyed()),
+  refresh: syncSessionCacheForCurrentConnection,
+  publish: (notice) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send("session-cache-refreshed", notice);
+  },
+  logError: (message, error) => console.error(`[sessions] ${message}`, error),
+});
 
 export function startMainProcess(): void {
   process.on("uncaughtException", (err) => {
@@ -46,9 +62,11 @@ export function startMainProcess(): void {
   registerIpcHandlers({
     activeRuns,
     getMainWindow: () => mainWindow,
+    getSessionRefreshScope: sessionRefreshCoordinator.getCurrentScope,
     notifyConnectionConfigChanged,
     notifyModelLibraryChanged,
     openExternalUrl,
+    requestSessionCacheSync: sessionRefreshCoordinator.request,
   });
 
   setupUpdater({ getMainWindow: () => mainWindow });
@@ -95,6 +113,7 @@ export function startMainProcess(): void {
     });
 
     createWindow();
+    sessionRefreshCoordinator.start();
     buildMenu({ getMainWindow: () => mainWindow, openExternalUrl });
 
     app.on("activate", () => {
@@ -107,6 +126,7 @@ export function startMainProcess(): void {
   });
 
   app.on("before-quit", () => {
+    sessionRefreshCoordinator.stop();
     stopHealthPolling();
     for (const abort of activeRuns.values()) abort();
     activeRuns.clear();
@@ -121,6 +141,7 @@ export function startMainProcess(): void {
 }
 
 function notifyConnectionConfigChanged(): void {
+  connectionGeneration += 1;
   mainWindow?.webContents.send(
     "connection-config-changed",
     getPublicConnectionConfig(),
@@ -178,7 +199,11 @@ function createWindow(): void {
   setGatewayPromptParent(() => mainWindow);
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
-    console.error("[CRASH] Renderer process gone:", details.reason, details.exitCode);
+    console.error(
+      "[CRASH] Renderer process gone:",
+      details.reason,
+      details.exitCode,
+    );
   });
   mainWindow.webContents.on("console-message", (details) => {
     // Electron ≥35 passes a single event object (level is now a string);
@@ -190,27 +215,40 @@ function createWindow(): void {
       );
     }
   });
-  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription) => {
-    console.error("[LOAD FAIL]", errorCode, errorDescription);
-  });
+  mainWindow.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription) => {
+      console.error("[LOAD FAIL]", errorCode, errorDescription);
+    },
+  );
   mainWindow.webContents.setWindowOpenHandler((details) => {
     openExternalUrl(details.url);
     return { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (isAllowedAppNavigationUrl(url, rendererHtmlPath, is.dev ? process.env["ELECTRON_RENDERER_URL"] : undefined)) return;
+    if (
+      isAllowedAppNavigationUrl(
+        url,
+        rendererHtmlPath,
+        is.dev ? process.env["ELECTRON_RENDERER_URL"] : undefined,
+      )
+    )
+      return;
     event.preventDefault();
     openExternalUrl(url);
   });
-  mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
-    const isWebPreview = params.partition === "web-preview";
-    if (!isAllowedWebviewUrl(params.src, isWebPreview)) {
-      event.preventDefault();
-      console.warn("[SECURITY] Blocked webview attachment for untrusted URL");
-      return;
-    }
-    hardenWebviewPreferences(webPreferences);
-  });
+  mainWindow.webContents.on(
+    "will-attach-webview",
+    (event, webPreferences, params) => {
+      const isWebPreview = params.partition === "web-preview";
+      if (!isAllowedWebviewUrl(params.src, isWebPreview)) {
+        event.preventDefault();
+        console.warn("[SECURITY] Blocked webview attachment for untrusted URL");
+        return;
+      }
+      hardenWebviewPreferences(webPreferences);
+    },
+  );
   mainWindow.webContents.on("context-menu", (_event, params) => {
     showChatContextMenu(mainWindow, params);
   });
