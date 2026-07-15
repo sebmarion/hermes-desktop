@@ -305,6 +305,38 @@ describe("Sessions tab live refresh (#322)", () => {
     expect(screen.queryByText("Older session")).toBeNull();
   });
 
+  it("lets a notice that supersedes the initial sync finish loading", async () => {
+    vi.useRealTimers();
+    const initialSync = deferred<unknown[]>();
+    const api = installHermesAPI();
+    api.syncSessionCache.mockReturnValue(initialSync.promise);
+    api.listCachedSessions.mockResolvedValue([
+      {
+        id: "generation-winner",
+        title: "Generation winner",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "desktop",
+        messageCount: 1,
+        model: "test-model",
+      },
+    ]);
+
+    const view = render(<Sessions {...baseProps} visible={true} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(view.container.querySelector(".sessions-loading")).not.toBeNull();
+
+    await act(async () => {
+      api.emitRefresh(refreshNotice());
+    });
+    await waitFor(() => {
+      expect(api.listCachedSessions).toHaveBeenCalledWith(50, 0);
+    });
+    expect(view.container.querySelector(".sessions-loading")).toBeNull();
+    expect(screen.getByText("Generation winner")).toBeTruthy();
+  });
+
   it("clears stale rows and reloads when the connection source changes", async () => {
     vi.useRealTimers();
     const api = installHermesAPI([

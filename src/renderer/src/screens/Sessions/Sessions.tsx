@@ -614,6 +614,7 @@ function Sessions({
             ) {
               return;
             }
+            setLoading(false);
             setSessions((previous) =>
               cached.length === 0 && previous.length > 0
                 ? previous
