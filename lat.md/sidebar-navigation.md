@@ -48,6 +48,18 @@ The Cmd/Ctrl+K menu action opens an 80%×80% modal that reuses the existing Sess
 
 The modal in [[src/renderer/src/screens/Layout/Layout.tsx#Layout]] renders [[src/renderer/src/screens/Sessions/Sessions.tsx]] inside a `.sessions-modal` over the shared `.models-modal-overlay` backdrop. Resuming a session or starting a new chat from the modal closes it; Esc and a backdrop click also close it. Because the Sessions screen owns its own fetching gated on `visible`, it loads only while the modal is open.
 
+## Background session refresh
+
+Electron main owns one five-second session refresh coordinator so minimized windows stay current without disabling Chromium renderer throttling.
+
+[[src/main/session-refresh-coordinator.ts#createSessionRefreshCoordinator]] owns that timer while a live primary window exists and provides the process-wide single-flight gate shared by timer ticks and explicit `sync-session-cache` IPC calls, so a slow local database, remote dashboard, or SSH fallback never overlaps another synchronization. Chromium's normal renderer background throttling stays enabled; minimizing or occluding Hermes One therefore does not keep unrelated renderer animation and Office work active.
+
+[[src/main/ipc/register.ts#syncSessionCacheForCurrentConnection]] remains the one routing path for local `state.db`, remote HTTP, and SSH/dashboard synchronization. Each run captures a scope made from connection mode, connection-configuration generation, and active profile. A result for an old scope is discarded, and one newest-scope follow-up starts immediately. Successful current-scope work emits a typed `session-cache-refreshed` generation notice through [[src/preload/session-refresh.ts#subscribeToSessionCacheRefreshed]]. Transient failures retain the currently rendered rows and retry at the next cadence without a toast.
+
+The notice carries no fixed-size row payload. [[src/renderer/src/screens/Layout/SidebarRecentSessions.tsx]] re-reads its exact loaded window plus one sentinel row, preserving infinite-scroll pagination and recomputing `hasMore`; [[src/renderer/src/screens/Sessions/Sessions.tsx]] quietly re-reads its first 50 cached rows while the modal is visible. Both consumers compare the notice with the current scope and use request generations so older initial, focus, or background reads cannot overwrite newer results. Their immediate initial loads, focus refreshes, profile/connection changes, mutation refreshes, and pagination remain in place; only the old renderer-owned 60-second and 30-second intervals are removed.
+
+On macOS, closing the final window leaves the coordinator allocated but idle because no live primary window exists. Recreating a window reuses the next scheduled tick. Application quit disposes the coordinator before the remaining process cleanup, suppressing publication from late in-flight work.
+
 ## Profile switch and active chat
 
 The footer profile switcher keeps the selected shell profile aligned with the visible chat run, while preserving older conversations under their original profiles.
