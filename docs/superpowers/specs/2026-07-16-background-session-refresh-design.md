@@ -46,9 +46,9 @@ Watching `state.db` and its WAL can avoid polling in local mode, but it is unrel
 
 The implementation introduces a small, dependency-injected refresh coordinator in the Electron main process.
 
-The coordinator owns the interval, one in-flight refresh promise, a pending-tick flag, and disposal state. A tick starts a refresh only when the prior refresh has completed. If another tick arrives during an in-flight refresh, the coordinator records one pending run instead of starting concurrent work.
+The coordinator owns the interval, a pending-tick flag, and disposal state. A process-wide session-sync gate owns the single in-flight refresh promise and is shared by every caller of session synchronization, including interval ticks, the `sync-session-cache` IPC handler used by initial/focus loads, and explicit mutation follow-ups. Callers requesting the same scope join the in-flight promise. A request for a different scope marks one pending run for that newer scope.
 
-The existing `sync-session-cache` IPC handler's local/remote/SSH routing becomes a reusable function. Both the IPC handler and the coordinator call that function, keeping one canonical routing path.
+The existing `sync-session-cache` IPC handler's local/remote/SSH routing becomes a reusable function behind that gate. Both the IPC handler and the coordinator enter through the gate, keeping one canonical routing path and one concurrency owner.
 
 Each refresh captures a scope identity derived from the active connection mode, connection configuration generation, and active profile. After a successful refresh, the coordinator rechecks that identity and drops the result when the scope changed while work was in flight.
 
@@ -76,9 +76,9 @@ The background refresh follows one path for every connection mode.
 
 ## Concurrency and stale results
 
-The coordinator allows at most one synchronization request at a time.
+The process-wide session-sync gate allows at most one synchronization request at a time across coordinator ticks, initial loads, focus refreshes, and explicit IPC calls.
 
-Multiple interval ticks collapse into one pending follow-up. A profile or connection change invalidates the captured scope and schedules an immediate run for the new scope; completion from the old scope is discarded before publication.
+Multiple interval ticks and same-scope IPC requests join or collapse into the current work. A profile or connection change invalidates the captured scope and records one immediate pending run for the new scope; completion from the old scope is discarded before publication. When the current promise settles, the gate starts that one newer-scope run before accepting another interval tick.
 
 Renderer consumers ignore notices after unmount, reject notices whose scope does not match their current profile/connection generation, and increment their request-generation guard before the exact-window read. An older initial, focus, or background read therefore cannot overwrite a newer result.
 
@@ -93,7 +93,7 @@ The coordinator logs a concise diagnostic, clears its in-flight state, and retri
 The implementation follows test-driven development.
 
 - Coordinator unit tests use fake timers to prove the 5,000 ms cadence.
-- A slow-refresh test proves ticks never create overlapping requests and at most one follow-up is queued.
+- A slow-refresh test proves interval, initial-load, and focus callers share one in-flight request and at most one follow-up is queued.
 - Disposal tests prove intervals stop and late promises cannot publish.
 - Scope tests prove a profile/connection switch discards an old in-flight result and immediately refreshes the new scope.
 - IPC/preload tests prove the typed notice subscription and cleanup contract.
