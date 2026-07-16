@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it, vi } from "vitest";
@@ -16,6 +16,9 @@ import {
   buildGatewayStatusCommand,
   parseHermesProfileListOutput,
   selectSshProfiles,
+  sshListCachedSessions,
+  sshListSessions,
+  sshSearchSessions,
 } from "../src/main/ssh-remote";
 import type { SshProfileInfo } from "../src/main/ssh-remote";
 import type { SshConfig } from "../src/main/ssh-tunnel";
@@ -110,6 +113,110 @@ describe("ssh remote config writes", () => {
       ).rejects.toThrow("Config value contains illegal characters");
     },
   );
+});
+
+describe("SSH compression lineage reads", () => {
+  it("projects before pagination and keeps the best old-segment search snippet", async () => {
+    const home = mkdtempSync(join(tmpdir(), "hermes-ssh-lineage-"));
+    const binDir = join(home, "bin");
+    const hermesDir = join(home, ".hermes");
+    const keyPath = join(home, "id_test");
+    const sshShim = join(binDir, "ssh");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(hermesDir, { recursive: true });
+    writeFileSync(keyPath, "test key");
+    writeFileSync(
+      sshShim,
+      [
+        "#!/bin/sh",
+        'for arg in "$@"; do remote_command="$arg"; done',
+        'exec /bin/sh -c "$remote_command"',
+        "",
+      ].join("\n"),
+    );
+    chmodSync(sshShim, 0o755);
+
+    execFileSync("/usr/bin/sqlite3", [
+      join(hermesDir, "state.db"),
+      `
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, source TEXT, started_at INTEGER,
+          ended_at INTEGER, message_count INTEGER, model TEXT, title TEXT,
+          parent_session_id TEXT, end_reason TEXT, model_config TEXT
+        );
+        CREATE TABLE messages (
+          id INTEGER PRIMARY KEY, session_id TEXT, content TEXT, timestamp INTEGER
+        );
+        INSERT INTO sessions VALUES
+          ('newer', 'webui', 50, NULL, 2, 'other-model', 'Newer', NULL, NULL, NULL),
+          ('tip', 'webui', 30, NULL, 3, 'tip-model', NULL, 'middle', NULL, NULL),
+          ('middle', 'webui', 20, 25, 8, 'middle-model', NULL, 'root', 'compression', NULL),
+          ('root', 'webui', 10, 15, 10, 'root-model', 'Needle lineage', NULL, 'compression', NULL),
+          ('delegate', 'webui', 8, NULL, 2, 'delegate-model', 'Delegate', 'root', NULL, '{"_delegate_from":"root"}'),
+          ('unknown-root', NULL, 7, 8, 1, 'unknown-model', 'Unknown root', NULL, 'compression', NULL),
+          ('unknown-child', NULL, 6, NULL, 1, 'unknown-model', 'Unknown child', 'unknown-root', NULL, NULL),
+          ('older', 'webui', 5, NULL, 1, 'older-model', 'Older', NULL, NULL, NULL);
+        INSERT INTO messages VALUES
+          (1, 'tip', 'needle', 31),
+          (2, 'middle', 'The best meaningful needle snippet from an old segment', 21),
+          (3, 'unknown-root', 'unknown-source root', 7),
+          (4, 'unknown-child', 'unknown-source child', 6);
+        WITH RECURSIVE sequence(value) AS (
+          SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 100
+        )
+        INSERT INTO messages (id, session_id, content, timestamp)
+          SELECT value + 100, 'tip', 'needle short ' || value, 31 + value
+          FROM sequence;
+      `,
+    ]);
+
+    const previousHome = process.env.HOME;
+    const previousPath = process.env.PATH;
+    process.env.HOME = home;
+    process.env.PATH = `${binDir}:${previousPath || ""}`;
+    const config = { ...sshConfig, keyPath };
+    try {
+      expect(
+        (await sshListSessions(config, 1, 2)).map((session) => session.id),
+      ).toEqual(["delegate"]);
+      expect(
+        (await sshListCachedSessions(config, 1, 2)).map(
+          (session) => session.id,
+        ),
+      ).toEqual(["delegate"]);
+      const visibleIds = (await sshListSessions(config, 20, 0)).map(
+        (session) => session.id,
+      );
+      expect(visibleIds).toContain("unknown-root");
+      expect(visibleIds).toContain("unknown-child");
+
+      const results = await sshSearchSessions(config, "needle", 10);
+      expect(results).toEqual([
+        expect.objectContaining({
+          sessionId: "tip",
+          title: "Needle lineage",
+          startedAt: 30,
+          messageCount: 3,
+          model: "tip-model",
+          snippet: expect.stringContaining("best meaningful"),
+        }),
+      ]);
+
+      const unknownResults = await sshSearchSessions(
+        config,
+        "unknown-source",
+        10,
+      );
+      expect(unknownResults.map((result) => result.sessionId).sort()).toEqual([
+        "unknown-child",
+        "unknown-root",
+      ]);
+    } finally {
+      process.env.HOME = previousHome;
+      process.env.PATH = previousPath;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("ssh Hermes command quoting", () => {
@@ -293,7 +400,9 @@ describe("selectSshProfiles", () => {
     // live state (correct HERMES_HOME, real gateway status), not the stale scan.
     const launcher = {
       present: true,
-      profiles: [profile("default", { gatewayRunning: true, model: "gpt-5.5" })],
+      profiles: [
+        profile("default", { gatewayRunning: true, model: "gpt-5.5" }),
+      ],
     };
     const scanned = [profile("default", { gatewayRunning: false })];
 

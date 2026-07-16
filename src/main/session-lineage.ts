@@ -5,11 +5,17 @@ export interface CompressionLineageRow {
   modelConfig?: string | Record<string, unknown> | null;
   source?: string | null;
   startedAt?: number | null;
+  endedAt?: number | null;
   lastActive?: number | null;
   messageCount?: number | null;
   title?: string | null;
+  cwd?: string | null;
+  archived?: boolean | number | null;
+  pinned?: boolean | number | null;
   contextFolder?: string | null;
+  relationshipType?: string;
   lineageRootId?: string;
+  lineageMemberIds?: string[];
   compressionSegmentCount?: number;
 }
 
@@ -44,12 +50,31 @@ function isCompressionContinuation(
 ): boolean {
   if (!parent || parent.endReason !== "compression") return false;
   if (child.parentSessionId !== parent.id) return false;
+  if (child.relationshipType === "child_session") return false;
   if ((child.source || "").toLowerCase() === "tool") return false;
   if (hasRelationshipMarker(child)) return false;
 
   const parentSource = (parent.source || "").trim().toLowerCase();
   const childSource = (child.source || "").trim().toLowerCase();
-  return !parentSource || !childSource || parentSource === childSource;
+  if (!parentSource || !childSource || parentSource !== childSource)
+    return false;
+
+  // A child that started before the compression parent actually closed is a
+  // concurrent/subthread session, not a continuation. WebUI uses the same
+  // boundary guard; without it Hermes One incorrectly folds these rows into
+  // the parent's lineage and never renders the subthread independently.
+  if (parent.endedAt != null) {
+    const parentEnded = Number(parent.endedAt);
+    const childStarted = Number(child.startedAt);
+    if (
+      !Number.isFinite(parentEnded) ||
+      !Number.isFinite(childStarted) ||
+      childStarted < parentEnded
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function activityScore(row: CompressionLineageRow): number {
@@ -62,6 +87,56 @@ function messageCount(row: CompressionLineageRow): number {
   return typeof value === "number" && Number.isFinite(value)
     ? Math.max(0, value)
     : 0;
+}
+
+function continuationPriority(row: CompressionLineageRow): number {
+  if (row.endReason === "compression") return 0;
+  if (row.endedAt == null) return 1;
+  return 2;
+}
+
+function compareContinuationCandidates(
+  a: CompressionLineageRow,
+  b: CompressionLineageRow,
+): number {
+  return (
+    continuationPriority(a) - continuationPriority(b) ||
+    Number(messageCount(b) > 0) - Number(messageCount(a) > 0) ||
+    activityScore(b) - activityScore(a) ||
+    (b.startedAt ?? 0) - (a.startedAt ?? 0) ||
+    b.id.localeCompare(a.id)
+  );
+}
+
+const GENERIC_CONVERSATION_TITLES = new Set([
+  "untitled",
+  "new chat",
+  "new conversation",
+  "cli session",
+  "tui session",
+  "acp session",
+  "continue the unfinished task from the parent",
+]);
+
+function isGenericConversationTitle(title: string | null | undefined): boolean {
+  const normalized = (title || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/, "")
+    .toLowerCase();
+  return GENERIC_CONVERSATION_TITLES.has(normalized);
+}
+
+function isGeneratedContinuationTitle(
+  tipTitle: string | null | undefined,
+  rootTitle: string | null | undefined,
+): boolean {
+  const tip = (tipTitle || "").trim();
+  const root = (rootTitle || "").trim();
+  const prefix = `${root} #`;
+  return Boolean(
+    root && tip.startsWith(prefix) && /^\d+$/.test(tip.slice(prefix.length)),
+  );
 }
 
 function mergeRootFallbacks<T extends CompressionLineageRow>(
@@ -81,11 +156,94 @@ function mergeRootFallbacks<T extends CompressionLineageRow>(
 
   // Compression continuations do not always inherit desktop-only metadata or a
   // generated title. Keep the root values only when the selected tip lacks one.
-  if (!tip.title && root.title) merged.title = root.title;
+  const rootTitle = root.title?.trim();
+  const tipTitle = tip.title?.trim();
+  if (
+    rootTitle &&
+    (!tipTitle ||
+      isGeneratedContinuationTitle(tipTitle, rootTitle) ||
+      (isGenericConversationTitle(tipTitle) &&
+        !isGenericConversationTitle(rootTitle)))
+  ) {
+    merged.title = rootTitle;
+  } else if (tipTitle) {
+    merged.title = tipTitle;
+  }
   if (!tip.contextFolder && root.contextFolder) {
     merged.contextFolder = root.contextFolder;
   }
+  if (!tip.cwd && root.cwd) merged.cwd = root.cwd;
+  if (tip.archived == null && root.archived != null)
+    merged.archived = root.archived;
+  if (Boolean(root.pinned) && !Boolean(tip.pinned)) merged.pinned = true;
   return merged;
+}
+
+/** Match the user-facing WebUI conversation list for local state.db rows. */
+export function isSharedConversationVisible(
+  row: Pick<CompressionLineageRow, "source" | "messageCount"> & {
+    message_count?: number | null;
+    isWorking?: boolean;
+  },
+): boolean {
+  const count =
+    row.messageCount ??
+    (typeof row.message_count === "number" ? row.message_count : 0);
+  if (count <= 0 && !row.isWorking) return false;
+  const source = (row.source || "").trim().toLowerCase();
+  if (!source) return false;
+  if (
+    source === "subagent" ||
+    source === "tool" ||
+    source === "cron" ||
+    source.startsWith("cron-") ||
+    source === "webhook" ||
+    source === "messaging"
+  ) {
+    return false;
+  }
+  return new Set([
+    "webui",
+    "cli",
+    "tui",
+    "acp",
+    "api_server",
+    "external_agent",
+    "external-agent",
+    "claude_code",
+    "desktop",
+  ]).has(source);
+}
+
+export const SHARED_CLI_VISIBLE_LIMIT = 20;
+
+export function isSharedCliConversation(
+  row: Pick<CompressionLineageRow, "source">,
+): boolean {
+  return new Set([
+    "cli",
+    "tui",
+    "acp",
+    "external_agent",
+    "external-agent",
+    "claude_code",
+  ]).has((row.source || "").trim().toLowerCase());
+}
+
+/** Keep state.db rows aligned with WebUI's capped imported-session window. */
+export function limitSharedConversationRows<T extends CompressionLineageRow>(
+  rows: readonly T[],
+): T[] {
+  const visible = rows.filter(isSharedConversationVisible);
+  const imported = visible
+    .filter(isSharedCliConversation)
+    .slice(0, SHARED_CLI_VISIBLE_LIMIT);
+  return [
+    ...visible.filter((row) => !isSharedCliConversation(row)),
+    ...imported,
+  ].sort(
+    (a, b) => activityScore(b) - activityScore(a) || b.id.localeCompare(a.id),
+  );
 }
 
 /**
@@ -114,9 +272,16 @@ export function buildCompressionLineageProjection<
     continuationChildIds.add(child.id);
   }
   for (const children of continuationChildren.values()) {
-    children.sort(
-      (a, b) => activityScore(b) - activityScore(a) || b.id.localeCompare(a.id),
-    );
+    children.sort(compareContinuationCandidates);
+  }
+
+  // Keep non-compression parent links visible as child sessions. The renderer
+  // uses this marker to attach branches/delegates/tools and cross-source rows
+  // beneath a loaded parent without treating them as duplicate conversations.
+  for (const row of copied) {
+    if (row.parentSessionId && !continuationChildIds.has(row.id)) {
+      row.relationshipType = row.relationshipType || "child_session";
+    }
   }
 
   const projected: CompressionLineageProjection<T>["projected"] = [];
@@ -139,15 +304,48 @@ export function buildCompressionLineageProjection<
       }
     }
 
-    const messageful = members.filter(({ row }) => messageCount(row) > 0);
-    const candidates = messageful.length > 0 ? messageful : members;
-    const selected = candidates.reduce((best, candidate) => {
-      const scoreDelta = activityScore(candidate.row) - activityScore(best.row);
-      if (scoreDelta > 0) return candidate;
-      if (scoreDelta === 0 && candidate.depth >= best.depth) return candidate;
-      return best;
-    });
+    // Follow the same deterministic forward path as Hermes Agent:
+    // compression child -> live child -> closed sibling. We still consume all
+    // continuation-looking siblings so malformed stale-parent fan-out projects
+    // to one row, but a newer ws_orphan_reap sibling cannot steal the tip.
+    let selected = { row: root, depth: 1 };
+    const pathSeen = new Set<string>([root.id]);
+    while (true) {
+      const children = continuationChildren.get(selected.row.id) ?? [];
+      const next = children.find((child) => !pathSeen.has(child.id));
+      if (!next) break;
+      pathSeen.add(next.id);
+      selected = { row: next, depth: selected.depth + 1 };
+    }
+    // Preserve the deterministic continuation path while it leads to a real
+    // transcript. A malformed/stale fan-out can leave that path at a
+    // zero-message terminal even though a later sibling contains the visible
+    // continuation. In that case only, fall back to the newest message-bearing
+    // member so the whole logical conversation cannot disappear.
+    if (messageCount(selected.row) <= 0) {
+      const messagefulFallback = members
+        .map(({ row }) => row)
+        .filter((row) => messageCount(row) > 0)
+        .sort(
+          (a, b) =>
+            activityScore(b) - activityScore(a) ||
+            (b.startedAt ?? 0) - (a.startedAt ?? 0) ||
+            b.id.localeCompare(a.id),
+        )[0];
+      if (messagefulFallback) {
+        selected = {
+          row: messagefulFallback,
+          depth:
+            members.find(({ row }) => row.id === messagefulFallback.id)
+              ?.depth ?? 1,
+        };
+      }
+    }
     const canonical = mergeRootFallbacks(root, selected.row, members.length);
+    canonical.lineageMemberIds = members.map(({ row }) => row.id);
+    if (members.some(({ row }) => Boolean(row.pinned))) {
+      canonical.pinned = true;
+    }
 
     projected.push(canonical);
     for (const { row } of members) {
@@ -176,4 +374,18 @@ export function projectCompressionLineages<T extends CompressionLineageRow>(
   rows: readonly T[],
 ): CompressionLineageProjection<T>["projected"] {
   return buildCompressionLineageProjection(rows).projected;
+}
+
+/** Return every physical segment represented by one projected session row. */
+export function compressionLineageMemberIdsForSession<
+  T extends CompressionLineageRow,
+>(rows: readonly T[], sessionId: string): string[] {
+  const projection = buildCompressionLineageProjection(rows);
+  const canonical = projection.canonicalBySessionId.get(sessionId);
+  if (!canonical) return [sessionId];
+  return rows
+    .filter(
+      (row) => projection.canonicalBySessionId.get(row.id)?.id === canonical.id,
+    )
+    .map((row) => row.id);
 }

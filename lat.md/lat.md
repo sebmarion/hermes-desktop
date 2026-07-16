@@ -9,9 +9,11 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[window-chrome]] — the browser-style title bar where open-conversation tabs sit on top of the window drag region, clickable while empty space still drags.
 - [[desktop-updates]] — GitHub release checks, startup upgrade button behavior, and the Settings auto-upgrade preference.
 - [[sidebar-navigation]] — the recent-sessions list under the Chat nav item, capped at five with a "Show more" button that opens the full session list in a modal.
+- The sidebar's conversation rows use the shared `~/.hermes/state.db` projection for title, archive state, workspace, counts, activity, and compression lineage; Hermes One's local context-folder/project grouping and pins remain desktop-only.
 - [[context-folder]] — the per-session linked working folder, persisted in a desktop-owned state.db table so a re-opened conversation restores its folder.
 - [[main-process]] — the Electron main-process entrypoint, app lifecycle modules, and centralized IPC registry.
 - [[provider-setup]] — the first-run provider picker; its top grid mirrors the agent's native `CANONICAL_PROVIDERS` while OpenAI-compatible endpoints route through the Local presets.
 - [[kanban]] — the JIRA-style multi-agent board tab; a thin client over the `hermes kanban` CLI with canonical status columns, an archived toggle, and focus/poll refresh.
 - [[analytics]] — privacy-first, opt-out usage analytics that POST anonymous events to the in-house Hermes analytics service, keyed by a per-install localStorage UUID; replaces the former PostHog integration.
 - [[wallet-token-balances]] — profile-scoped Base mainnet wallets with encrypted recovery phrases, and on-chain ERC-20 token balance reads via ethers v6.
+- [[testing]] — shared Vitest/jsdom setup and runtime compatibility guarantees for the test environment.

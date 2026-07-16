@@ -17,7 +17,12 @@ import {
   type SkillSearchResult,
 } from "./skills";
 import type { MemoryInfo } from "./memory";
-import type { HistoryItem, SessionSummary, SearchResult } from "./sessions";
+import {
+  dedupeSearchResultsBySession,
+  type HistoryItem,
+  type SessionSummary,
+  type SearchResult,
+} from "./sessions";
 import type { CachedSession } from "./session-cache";
 import type { Attachment } from "../shared/attachments";
 import { isImageMime, MAX_IMAGE_BYTES } from "../shared/attachments";
@@ -477,7 +482,7 @@ async function sshGetSessionStats(
   profile?: string,
 ): Promise<{ totalSessions: number; totalMessages: number }> {
   const script = `
-import sqlite3, json, os, sys
+import sqlite3, json, os, sys, time
 payload = json.load(sys.stdin)
 profile = payload.get("profile")
 db = os.path.expanduser(f"~/.hermes/profiles/{profile}/state.db" if profile and profile != "default" else "~/.hermes/state.db")
@@ -1304,10 +1309,44 @@ rows = conn.execute(
     "SELECT id, source, started_at, ended_at, message_count, model, title, "
     + optional("parent_session_id") + ", "
     + optional("end_reason") + ", "
-    + optional("model_config")
+    + optional("model_config") + ", "
+    + optional("archived") + ", "
+    + optional("pinned") + ", "
+    + optional("cwd") + ", "
+    + optional("last_activity_at")
     + " FROM sessions ORDER BY started_at DESC"
 ).fetchall()
-print(json.dumps([dict(r) for r in rows]))
+activity = {}
+try:
+    table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_activity'").fetchone()
+    if table:
+        for item in conn.execute(
+            "SELECT session_id, phase, started_at, heartbeat_at FROM session_activity WHERE heartbeat_at >= ?",
+            (time.time() - 20,),
+        ).fetchall():
+            sid = str(item["session_id"] or "")
+            if not sid:
+                continue
+            started = float(item["started_at"] or 0)
+            heartbeat = float(item["heartbeat_at"] or 0)
+            previous = activity.get(sid)
+            if previous is None or heartbeat >= previous["activity_heartbeat_at"]:
+                activity[sid] = {
+                    "is_working": True,
+                    "activity_phase": str(item["phase"] or "running"),
+                    "activity_started_at": started,
+                    "activity_heartbeat_at": heartbeat,
+                }
+            else:
+                previous["activity_started_at"] = min(previous["activity_started_at"], started)
+except Exception:
+    activity = {}
+payload = []
+for row in rows:
+    item = dict(row)
+    item.update(activity.get(str(item.get("id") or ""), {}))
+    payload.append(item)
+print(json.dumps(payload))
 conn.close()
 `;
   try {
@@ -1323,11 +1362,19 @@ conn.close()
       parent_session_id: string | null;
       end_reason: string | null;
       model_config: string | null;
+      archived?: number | boolean | null;
+      pinned?: number | boolean | null;
+      cwd?: string | null;
+      last_activity_at?: number | null;
+      is_working?: boolean;
+      activity_phase?: string | null;
+      activity_started_at?: number | null;
+      activity_heartbeat_at?: number | null;
     }>;
     return projectCompressionLineages(
       rows.map((row) => ({
         id: row.id,
-        source: row.source || "cli",
+        source: row.source || "",
         startedAt: row.started_at,
         endedAt: row.ended_at,
         messageCount: row.message_count || 0,
@@ -1337,8 +1384,30 @@ conn.close()
         parentSessionId: row.parent_session_id,
         endReason: row.end_reason,
         modelConfig: row.model_config,
+        ...(Object.prototype.hasOwnProperty.call(row, "archived")
+          ? { archived: Boolean(row.archived) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "pinned")
+          ? { pinned: Boolean(row.pinned) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "cwd")
+          ? { cwd: row.cwd ?? null }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "last_activity_at")
+          ? { lastActive: row.last_activity_at ?? null }
+          : {}),
+        ...(row.is_working
+          ? {
+              isWorking: true,
+              activityPhase: row.activity_phase || "running",
+              activityStartedAt: row.activity_started_at ?? 0,
+              activityHeartbeatAt: row.activity_heartbeat_at ?? 0,
+            }
+          : {}),
       })),
-    ).slice(offset, offset + limit);
+    )
+      .slice(offset, offset + limit)
+      .map((row) => ({ ...row, source: row.source || "cli" }));
   } catch {
     return [];
   }
@@ -1615,19 +1684,27 @@ def optional(name):
     return name if name in columns else f"NULL AS {name}"
 try:
     matches = conn.execute(
-        "SELECT s.id, s.title, s.started_at, s.source, s.message_count, s.model, m.content as snippet "
-        "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+        "SELECT s.id, s.title, s.started_at, s.source, s.message_count, s.model, "
+        "(SELECT m.content FROM messages m "
+        " WHERE m.session_id = s.id AND lower(coalesce(m.content, '')) LIKE lower(?) "
+        " ORDER BY length(coalesce(m.content, '')) DESC, m.timestamp ASC, m.id ASC LIMIT 1) as snippet "
+        "FROM sessions s "
         "WHERE lower(coalesce(s.title, '')) LIKE lower(?) "
         "OR lower(s.id) LIKE lower(?) "
-        "OR lower(coalesce(m.content, '')) LIKE lower(?) "
-        "ORDER BY s.started_at DESC, m.timestamp ASC, m.id ASC LIMIT ?",
-        (f"%{query}%", f"%{query}%", f"%{query}%", max(limit * 8, 50))
+        "OR EXISTS (SELECT 1 FROM messages m "
+        "           WHERE m.session_id = s.id AND lower(coalesce(m.content, '')) LIKE lower(?)) "
+        "ORDER BY s.started_at DESC LIMIT ?",
+        (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%", max(limit * 8, 50))
     ).fetchall()
     sessions = conn.execute(
-        "SELECT id, title, started_at, source, message_count, model, "
+        "SELECT id, title, started_at, ended_at, source, message_count, model, "
         + optional("parent_session_id") + ", "
         + optional("end_reason") + ", "
-        + optional("model_config")
+        + optional("model_config") + ", "
+        + optional("archived") + ", "
+        + optional("pinned") + ", "
+        + optional("cwd") + ", "
+        + optional("last_activity_at")
         + " FROM sessions"
     ).fetchall()
     print(json.dumps({"matches": [dict(r) for r in matches], "sessions": [dict(r) for r in sessions]}))
@@ -1645,6 +1722,7 @@ conn.close()
       id: string;
       title: string | null;
       started_at: number;
+      ended_at?: number | null;
       source: string | null;
       message_count: number | null;
       model: string | null;
@@ -1652,6 +1730,10 @@ conn.close()
       parent_session_id?: string | null;
       end_reason?: string | null;
       model_config?: string | null;
+      archived?: number | boolean | null;
+      pinned?: number | boolean | null;
+      cwd?: string | null;
+      last_activity_at?: number | null;
     };
     const payload = JSON.parse(out.trim() || "{}") as {
       matches?: RawSearchRow[];
@@ -1662,21 +1744,31 @@ conn.close()
         id: row.id,
         title: row.title,
         startedAt: row.started_at,
-        source: row.source || "cli",
+        endedAt: row.ended_at,
+        source: row.source || "",
         messageCount: row.message_count || 0,
         model: row.model || "",
         parentSessionId: row.parent_session_id,
         endReason: row.end_reason,
         modelConfig: row.model_config,
+        ...(Object.prototype.hasOwnProperty.call(row, "archived")
+          ? { archived: Boolean(row.archived) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "pinned")
+          ? { pinned: Boolean(row.pinned) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "cwd")
+          ? { cwd: row.cwd ?? null }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "last_activity_at")
+          ? { lastActive: row.last_activity_at ?? null }
+          : {}),
       })),
     );
-    const seen = new Set<string>();
     const results: SearchResult[] = [];
     for (const match of payload.matches ?? []) {
       const canonical = lineage.canonicalBySessionId.get(match.id);
       const sessionId = canonical?.id ?? match.id;
-      if (seen.has(sessionId)) continue;
-      seen.add(sessionId);
       const snippet =
         match.snippet || match.title || `Session ${match.id.slice(-6)}`;
       results.push({
@@ -1685,12 +1777,11 @@ conn.close()
         startedAt: canonical?.startedAt ?? match.started_at,
         source: canonical?.source || match.source || "cli",
         messageCount: canonical?.messageCount ?? match.message_count ?? 0,
-        model: canonical?.model || match.model || "",
+        model: canonical ? canonical.model : match.model || "",
         snippet: snippet.slice(0, 500),
       });
-      if (results.length >= limit) break;
     }
-    return results;
+    return dedupeSearchResultsBySession(results, limit);
   } catch {
     return [];
   }
@@ -2638,8 +2729,7 @@ export async function sshListCachedSessions(
   limit = 50,
   offset = 0,
 ): Promise<CachedSession[]> {
-  void offset;
-  const sessions = await sshListSessions(config, limit, 0);
+  const sessions = await sshListSessions(config, limit, offset);
   return sessions.map((s) => ({
     id: s.id,
     title: s.title || s.id,
@@ -2648,6 +2738,10 @@ export async function sshListCachedSessions(
     messageCount: s.messageCount,
     model: s.model,
     contextFolder: null,
+    ...(s.cwd !== undefined ? { cwd: s.cwd ?? null } : {}),
+    ...(s.archived !== undefined ? { archived: s.archived } : {}),
+    ...(s.pinned !== undefined ? { pinned: s.pinned } : {}),
+    ...(s.lastActive !== undefined ? { lastActive: s.lastActive ?? null } : {}),
   }));
 }
 
@@ -2800,6 +2894,112 @@ export async function sshListModels(config: SshConfig): Promise<SavedModel[]> {
   }
   return [];
 }
+
+export async function sshUpdateSessionMetadata(
+  config: SshConfig,
+  sessionId: string,
+  fields: { title?: string; cwd?: string; archived?: boolean; pinned?: boolean },
+  profile?: string,
+): Promise<void> {
+  const script = `
+import sqlite3, json, os, sys
+payload = json.load(sys.stdin)
+profile = payload.get("profile")
+db_path = os.path.expanduser(f"~/.hermes/profiles/{profile}/state.db" if profile and profile != "default" else "~/.hermes/state.db")
+if not os.path.exists(db_path):
+    raise SystemExit("state.db is unavailable on the remote host")
+conn = sqlite3.connect(db_path)
+try:
+    sid = str(payload.get("sessionId") or "")
+    fields = payload.get("fields") or {}
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    lineage_ids = [sid]
+    if {"id", "parent_session_id", "end_reason", "source"}.issubset(columns):
+        branch_guard = (
+            "(child.model_config IS NULL OR NOT json_valid(child.model_config) OR "
+            "(COALESCE(json_extract(child.model_config, '$._branched_from'), '') = '' AND "
+            "COALESCE(json_extract(child.model_config, '$._delegate_from'), '') = ''))"
+            if "model_config" in columns else "1 = 1"
+        )
+        lineage_ids = [
+            row[0] for row in conn.execute(
+                f"""
+                WITH RECURSIVE lineage(id, source) AS (
+                    SELECT id, LOWER(TRIM(COALESCE(source, '')))
+                    FROM sessions WHERE id = ?
+                    UNION
+                    SELECT parent.id, LOWER(TRIM(COALESCE(parent.source, '')))
+                    FROM sessions child
+                    JOIN lineage current ON current.id = child.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                      AND LOWER(TRIM(COALESCE(parent.source, ''))) = current.source
+                      AND LOWER(TRIM(COALESCE(child.source, ''))) = current.source
+                      AND {branch_guard}
+                    UNION
+                    SELECT child.id, LOWER(TRIM(COALESCE(child.source, '')))
+                    FROM sessions parent
+                    JOIN lineage current ON current.id = parent.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                      AND LOWER(TRIM(COALESCE(child.source, ''))) = current.source
+                      AND LOWER(TRIM(COALESCE(child.source, ''))) <> 'tool'
+                      AND {branch_guard}
+                )
+                SELECT id FROM lineage
+                """,
+                (sid,),
+            ).fetchall()
+        ] or [sid]
+    if fields.get("title") is not None and "title" in columns:
+        conn.executemany("UPDATE sessions SET title = ? WHERE id = ?", [(str(fields["title"]), value) for value in lineage_ids])
+    if fields.get("cwd") is not None and "cwd" in columns:
+        conn.executemany("UPDATE sessions SET cwd = ? WHERE id = ?", [(str(fields["cwd"]), value) for value in lineage_ids])
+    if fields.get("archived") is not None and "archived" in columns:
+        conn.executemany("UPDATE sessions SET archived = ? WHERE id = ?", [(1 if fields["archived"] else 0, value) for value in lineage_ids])
+    if fields.get("pinned") is not None:
+        if "pinned" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        conn.executemany("UPDATE sessions SET pinned = ? WHERE id = ?", [(1 if fields["pinned"] else 0, value) for value in lineage_ids])
+    conn.commit()
+finally:
+    conn.close()
+print("ok")
+`;
+  await sshPython(
+    config,
+    script,
+    pythonJsonInput({ profile, sessionId, fields }),
+  );
+}
+
+export const sshUpdateSessionTitle = (
+  config: SshConfig,
+  sessionId: string,
+  title: string,
+  profile?: string,
+): Promise<void> => sshUpdateSessionMetadata(config, sessionId, { title }, profile);
+
+export const sshUpdateSessionArchived = (
+  config: SshConfig,
+  sessionId: string,
+  archived: boolean,
+  profile?: string,
+): Promise<void> => sshUpdateSessionMetadata(config, sessionId, { archived }, profile);
+
+export const sshUpdateSessionWorkspace = (
+  config: SshConfig,
+  sessionId: string,
+  cwd: string,
+  profile?: string,
+): Promise<void> => sshUpdateSessionMetadata(config, sessionId, { cwd }, profile);
+
+export const sshUpdateSessionPinned = (
+  config: SshConfig,
+  sessionId: string,
+  pinned: boolean,
+  profile?: string,
+): Promise<void> => sshUpdateSessionMetadata(config, sessionId, { pinned }, profile);
 
 export async function sshSaveModels(
   config: SshConfig,

@@ -168,12 +168,93 @@ vi.mock("better-sqlite3", () => {
         return { changes: 1 };
       }
 
+      if (
+        this.sql.includes("WITH RECURSIVE lineage") &&
+        (this.sql.includes("UPDATE sessions SET title") ||
+          this.sql.includes("SET title = CASE WHEN"))
+      ) {
+        const [sessionId] = args;
+        const seed = this.store.sessions.get(String(sessionId));
+        if (!seed) return { changes: 0 };
+        const lineageIds = new Set<string>([seed.id]);
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const candidate of this.store.sessions.values()) {
+            if (
+              candidate.parent_session_id &&
+              lineageIds.has(candidate.parent_session_id) &&
+              this.store.sessions.get(candidate.parent_session_id)
+                ?.end_reason === "compression" &&
+              candidate.source === seed.source &&
+              !lineageIds.has(candidate.id)
+            ) {
+              lineageIds.add(candidate.id);
+              changed = true;
+            }
+            if (
+              lineageIds.has(candidate.id) &&
+              candidate.parent_session_id &&
+              this.store.sessions.get(candidate.parent_session_id)?.source ===
+                seed.source &&
+              this.store.sessions.get(candidate.parent_session_id)
+                ?.end_reason === "compression" &&
+              !lineageIds.has(candidate.parent_session_id)
+            ) {
+              lineageIds.add(candidate.parent_session_id);
+              changed = true;
+            }
+          }
+        }
+        if (this.sql.includes("CASE WHEN id = ? THEN ? ELSE NULL END")) {
+          const targetId = String(args[1]);
+          const title = String(args[2]);
+          for (const id of lineageIds) {
+            const row = this.store.sessions.get(id);
+            if (row) row.title = id === targetId ? title : null;
+          }
+        } else {
+          const title = String(args[1]);
+          for (const id of lineageIds) {
+            const row = this.store.sessions.get(id);
+            if (row) row.title = title;
+          }
+        }
+        return { changes: lineageIds.size };
+      }
+
+      if (this.sql.includes("UPDATE sessions SET title = ? WHERE id = ?")) {
+        const [title, sessionId] = args;
+        const row = this.store.sessions.get(String(sessionId));
+        if (!row) return { changes: 0 };
+        row.title = String(title);
+        return { changes: 1 };
+      }
+
       throw new Error(`Unhandled fake run SQL: ${this.sql}`);
     }
 
     all(
       ...args: unknown[]
-    ): SessionRow[] | Array<{ id: string; message_count: number }> {
+    ):
+      | SessionRow[]
+      | Array<{ id: string; message_count: number }>
+      | Array<{ cid: number; name: string }> {
+      if (/PRAGMA\s+table_info\(sessions\)/i.test(this.sql)) {
+        return [
+          "id",
+          "source",
+          "started_at",
+          "ended_at",
+          "message_count",
+          "model",
+          "title",
+          "parent_session_id",
+          "end_reason",
+          "model_config",
+        ].map((name, cid) => ({ cid, name }));
+      }
+
       if (this.sql.includes("FROM sessions s")) {
         const threshold = Number(args[0] ?? 0);
         return Array.from(this.store.sessions.values())
@@ -204,7 +285,9 @@ vi.mock("better-sqlite3", () => {
       throw new Error(`Unhandled fake all SQL: ${this.sql}`);
     }
 
-    get(...args: unknown[]): { content: string } | undefined {
+    get(
+      ...args: unknown[]
+    ): { content?: string; title?: string | null } | undefined {
       // `tableExists` probes sqlite_master before reading context folders
       // (issue #27). The desktop context-folder table is never created in
       // these tests, so report it absent — sessions then resolve to a null
@@ -224,6 +307,11 @@ vi.mock("better-sqlite3", () => {
           )
           .sort((a, b) => a.timestamp - b.timestamp || a.id - b.id)[0];
         return match ? { content: match.content } : undefined;
+      }
+
+      if (this.sql.includes("SELECT title FROM sessions WHERE id = ?")) {
+        const match = this.store.sessions.get(String(args[0]));
+        return match ? { title: match.title } : undefined;
       }
 
       throw new Error(`Unhandled fake get SQL: ${this.sql}`);
@@ -254,7 +342,11 @@ vi.mock("better-sqlite3", () => {
 });
 
 import Database from "better-sqlite3";
-import { syncSessionCache } from "../src/main/session-cache";
+import {
+  listCachedSessions,
+  syncSessionCache,
+  updateSessionTitle,
+} from "../src/main/session-cache";
 import { closeDbConnection } from "../src/main/db";
 
 const CACHE_FILE = join(TEST_HOME, "desktop", "sessions.json");
@@ -333,6 +425,31 @@ afterEach(() => {
 });
 
 describe("syncSessionCache", () => {
+  it("keeps pinned conversations in the first sidebar page", () => {
+    const sessions = Array.from({ length: 35 }, (_, index) => ({
+      id: `session-${index}`,
+      title: `Session ${index}`,
+      startedAt: 1_000 - index,
+      source: "webui",
+      messageCount: 1,
+      model: "gpt-5.6-sol",
+      contextFolder: null,
+      archived: false,
+      pinned: index === 34,
+    }));
+    mkdirSync(join(TEST_HOME, "desktop"), { recursive: true });
+    writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({ sessions, lastSync: 1 }),
+      "utf-8",
+    );
+
+    const firstPage = listCachedSessions(30, 0);
+
+    expect(firstPage).toHaveLength(30);
+    expect(firstPage.some((session) => session.id === "session-34")).toBe(true);
+  });
+
   it("returns an empty list when no DB exists yet", () => {
     expect(syncSessionCache()).toEqual([]);
   });
@@ -402,6 +519,127 @@ describe("syncSessionCache", () => {
       sessions: Array<{ id: string }>;
     };
     expect(persisted.sessions.map((session) => session.id)).toEqual(["tip"]);
+  });
+
+  it("derives a cold-cache lineage title from the root's first user turn", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      {
+        id: "root",
+        started_at: now,
+        message_count: 2,
+        end_reason: "compression",
+        firstUserMessage: "Original root intent for the conversation",
+      },
+      {
+        id: "tip",
+        parent_session_id: "root",
+        started_at: now + 10,
+        message_count: 2,
+        firstUserMessage: "Continue after compaction",
+      },
+    ]);
+
+    const result = syncSessionCache();
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      id: "tip",
+      lineageRootId: "root",
+      title: "Original root intent for the conversation",
+    });
+  });
+
+  it("persists a missing first-prompt title as canonical state.db metadata", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const firstPrompt =
+      "You are the conditional frontier auditor for an Ornith-first coding supervisor.";
+    seedDb([
+      {
+        id: "untitled-cli",
+        source: "cli",
+        started_at: now,
+        message_count: 2,
+        firstUserMessage: firstPrompt,
+      },
+    ]);
+
+    expect(syncSessionCache()[0].title).toBe(firstPrompt.slice(0, 64));
+    const db = new Database(DB_PATH);
+    expect(
+      db.prepare("SELECT title FROM sessions WHERE id = ?").get("untitled-cli"),
+    ).toEqual({ title: firstPrompt.slice(0, 64) });
+    db.close();
+  });
+
+  it("keeps a renamed lineage title only on the visible requested segment", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      {
+        id: "rename-root",
+        started_at: now,
+        message_count: 4,
+        end_reason: "compression",
+      },
+      {
+        id: "rename-tip",
+        parent_session_id: "rename-root",
+        started_at: now + 10,
+        message_count: 2,
+      },
+    ]);
+
+    updateSessionTitle("rename-tip", "Canonical renamed title");
+
+    const db = new Database(DB_PATH);
+    expect(
+      db.prepare("SELECT title FROM sessions WHERE id = ?").get("rename-root"),
+    ).toEqual({ title: null });
+    expect(
+      db.prepare("SELECT title FROM sessions WHERE id = ?").get("rename-tip"),
+    ).toEqual({ title: "Canonical renamed title" });
+    db.close();
+  });
+
+  it("drops a stale generated tip title when lineage metadata appears", () => {
+    const now = Math.floor(Date.now() / 1000);
+    mkdirSync(join(TEST_HOME, "desktop"), { recursive: true });
+    writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({
+        sessions: [
+          {
+            id: "tip",
+            title: "Stale continuation title",
+            startedAt: now + 10,
+            source: "cli",
+            messageCount: 2,
+            model: "gpt-4o",
+            contextFolder: null,
+          },
+        ],
+        lastSync: 0,
+      }),
+    );
+    seedDb([
+      {
+        id: "root",
+        started_at: now,
+        message_count: 3,
+        title: "Root-owned title",
+        end_reason: "compression",
+      },
+      {
+        id: "tip",
+        parent_session_id: "root",
+        started_at: now + 10,
+        message_count: 2,
+      },
+    ]);
+
+    expect(syncSessionCache()).toEqual([
+      expect.objectContaining({ id: "tip", title: "Root-owned title" }),
+    ]);
   });
 
   it("keeps a marked branch beside its parent's canonical tip", () => {

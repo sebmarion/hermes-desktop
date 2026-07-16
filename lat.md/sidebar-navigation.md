@@ -16,15 +16,21 @@ The inline list lazily loads cached sessions in pages as the user scrolls, so th
 
 [[src/renderer/src/screens/Layout/SidebarRecentSessions.tsx]] fetches `RECENT_SESSIONS_PAGE_SIZE + 1` rows from the `sessions.json` cache to detect whether another page exists. [[src/renderer/src/screens/Layout/Layout.tsx#Layout]] passes the chat scroll container ref down, and the sidebar loads the next page when that container nears the bottom. The initial sync still refreshes `state.db`, then paints the first page.
 
+Background convergence is commit-driven rather than list-driven. [[src/main/session-revision.ts#SessionRevisionTracker]] keeps a dedicated read-only SQLite connection and combines its `PRAGMA data_version` with the database file identity, while [[src/renderer/src/screens/Layout/use-session-revision-poll.ts#useSessionRevisionPoll]] polls that cheap token every five seconds. An unchanged token never rebuilds the cache; a changed token triggers one sync. The poll stays mounted when the sidebar is collapsed or another app route is visible, and the primary BrowserWindow disables background timer throttling so minimized Hermes One windows also converge. Remote/SSH modes, or a temporarily missing database, use a bounded 30-second full-sync fallback.
+
 Session titles in the inline list are constrained to the sidebar width and truncate with ellipses, while the chat section only scrolls vertically. This keeps long generated titles from creating a horizontal scrollbar.
 
 ## Compression lineage projection
 
 Compressed conversations remain one visible session even though Hermes stores each continuation segment as a separate database row.
 
-[[src/main/session-lineage.ts#projectCompressionLineages]] collapses only unmarked, same-source children of rows whose `end_reason` is `compression`. The canonical row navigates to the freshest messageful tip while retaining a missing root title or context folder; branches, delegated runs, tool sessions, and cross-source children remain independent. [[src/main/sessions.ts#listSessions]], [[src/main/sessions.ts#searchSessions]], [[src/main/session-cache.ts#syncSessionCache]], and remote/SSH bridges apply the same read-only projection before returning or caching rows, without mutating `state.db`.
+[[src/main/session-lineage.ts#projectCompressionLineages]] collapses only unmarked, same-source children of rows whose `end_reason` is `compression`. The canonical row follows the deterministic continuation path while it has messages; if that path ends at a zero-message terminal, it falls back to the newest message-bearing sibling in the same lineage. Meaningful root titles replace generated tip placeholders such as `Untitled`, `Cli Session`, `Continue the unfinished task from the parent`, and numbered `#N` continuation suffixes. [[src/main/sessions.ts#listSessions]], [[src/main/sessions.ts#searchSessions]], [[src/main/session-cache.ts#syncSessionCache]], and remote/SSH bridges apply the same logical projection before returning or caching rows. When a shared row has no title, the cache sync derives WebUI's deterministic 64-character first-user fallback and writes that title once through the compression lineage so both surfaces subsequently read it from `state.db`; identity, messages, archive state, and pins are not rewritten.
 
-The visible message count comes from the selected tip segment, matching modern Hermes session-catalog behavior. Projection happens before local and SSH pagination so hidden parent segments cannot consume page slots.
+The visible ID, timestamps, model, and message count come from the selected tip segment; counts are never summed. Unknown sources remain unknown until after projection, and cached `endedAt` is emitted only when the selected tip supplied it. [[src/main/session-schema.ts#sessionLineageSelectList]] substitutes NULL aliases when older local schemas lack lineage columns.
+
+[[src/renderer/src/screens/Layout/sidebar-session-tree.ts#attachSidebarChildSessions]] applies the same parent-only sidebar contract as Hermes WebUI. Branches, delegated runs, tools, and other `child_session` rows remain directly addressable but are reference metadata rather than independent or nested sidebar conversations. A loaded child's working phase or pin bubbles to its visible ancestor; an orphan child reference is suppressed instead of promoted.
+
+Projection happens before local, remote HTTP, and SSH pagination so hidden parent segments cannot consume page slots. Local, HTTP, and SSH search redirect old-segment hits to the canonical tip, deduplicate them, and retain the strongest matching snippet.
 
 The native sidebar scrollbar is hidden to avoid layout shifts. [[src/renderer/src/screens/Layout/Layout.tsx#Layout]] measures the chat scroll container and renders an absolutely positioned overlay thumb only while the user is scrolling, so showing or hiding the scrollbar never changes row width.
 
@@ -36,6 +42,14 @@ Workspace-linked conversations are grouped under project rows so repository chat
 
 When [[src/renderer/src/screens/Chat/Chat.tsx#Chat]] saves a session context folder, it emits a renderer event that [[src/renderer/src/screens/Layout/SidebarRecentSessions.tsx]] uses to force-refresh the cache. This keeps project grouping visible immediately after a workspace is linked.
 
+Shared session metadata comes from Hermes Agent's canonical `~/.hermes/state.db`
+projection. The cached row carries the shared title, compression-lineage tip,
+message count, activity time, archive state, and agent working directory
+(`cwd`). `contextFolder` remains a Hermes One desktop presentation binding used
+only for project grouping; it is deliberately distinct from the shared agent
+workspace. Remote mode reads and mutates these fields through the Mac WebUI
+session API and never transfers the SQLite file.
+
 Projects and Chats are top-level collapsible sections, and each project folder can also be expanded or collapsed. [[src/renderer/src/screens/Layout/SidebarRecentSessions.tsx]] persists those disclosure states in `localStorage`; the sidebar CSS keeps section and folder rows on the same left rail, keeps disclosure arrows right-aligned, animates each disclosure with grid-row transitions, and removes hidden rows from keyboard tab order.
 
 ## Row context menu
@@ -46,9 +60,9 @@ Each sidebar session row exposes a ChatGPT-style options menu — Pin, Rename, M
 
 Transitions are `motion/react`-driven (the same library as [[src/renderer/src/components/modal/AppModal.tsx#AppModal]]): the whole menu fades/scales/blurs from its top-left anchor on open, and an internal `open` flag plays the exit before the parent unmounts it (`AnimatePresence onExitComplete` → `onClose`). Switching between the main and project pages cross-slides them (direction-aware) inside a `.sidebar-session-menu-body` wrapper whose `layout` prop animates the height difference; the wrapper clips the sliding pages. Viewport clamping measures the offset box, not `getBoundingClientRect`, so an in-flight scale/height animation doesn't skew positioning.
 
-Each action calls an existing desktop API with an optimistic local update and rollback on failure: Rename → `updateSessionTitle` (inline `.sidebar-recent-session-rename` input), Move → [[src/main/session-context-folder-store.ts#setSessionContextFolder]] then a `hermes-session-context-folder-changed` event so other surfaces re-group, Delete → a confirmation dialog (portal overlay) then [[src/main/sessions.ts#deleteSessionRows|deleteSession]]. Deleting the open chat calls `onSessionDeleted`, which [[src/renderer/src/screens/Layout/Layout.tsx#Layout]] uses to drop to a fresh New Chat.
+Each action calls a desktop API with an optimistic local update and rollback on failure: Rename → `updateSessionTitle` (inline `.sidebar-recent-session-rename` input), Archive/Unarchive → `updateSessionArchived` across the shared compression lineage, Set agent workspace → `updateSessionWorkspace` for `state.db.sessions.cwd`, Move → [[src/main/session-context-folder-store.ts#setSessionContextFolder]] then a `hermes-session-context-folder-changed` event so other surfaces re-group, Delete → a confirmation dialog (portal overlay) then [[src/main/sessions.ts#deleteSessionRows|deleteSession]]. Deleting the open chat calls `onSessionDeleted`, which [[src/renderer/src/screens/Layout/Layout.tsx#Layout]] uses to drop to a fresh New Chat.
 
-Pinned rows are a desktop-only affordance: their ids live in `localStorage` (`hermes.sidebar.pinnedSessions`), and pinned sessions are pulled out of the normal grouping into a collapsible **Pinned** section at the top of the list.
+Pins come from the canonical `state.db` projection. A pin on any compression segment represents the logical conversation once; hidden physical segments and child/reference rows never create duplicate pinned rows. Pinned conversations are pulled out of normal grouping into a collapsible **Pinned** section at the top of the list.
 
 ## Full-list modal
 

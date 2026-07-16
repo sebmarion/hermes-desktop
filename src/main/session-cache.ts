@@ -11,7 +11,17 @@ import { t } from "../shared/i18n";
 import { getAppLocale } from "./locale";
 import { getDbConnection } from "./db";
 import { getSessionContextFolders } from "./session-context-folder-store";
-import { projectCompressionLineages } from "./session-lineage";
+import {
+  isSharedConversationVisible,
+  limitSharedConversationRows,
+  projectCompressionLineages,
+} from "./session-lineage";
+import {
+  applySessionActivity,
+  ensureSharedSessionSchema,
+  readSessionActivity,
+  sessionLineageSelectList,
+} from "./session-schema";
 
 /**
  * The session cache lives alongside its own profile's data so profiles
@@ -31,6 +41,7 @@ export interface CachedSession {
   id: string;
   title: string;
   startedAt: number;
+  endedAt?: number | null;
   source: string;
   messageCount: number;
   model: string;
@@ -38,8 +49,18 @@ export interface CachedSession {
   parentSessionId?: string | null;
   endReason?: string | null;
   modelConfig?: string | null;
+  relationshipType?: string;
   lineageRootId?: string;
+  lineageMemberIds?: string[];
   compressionSegmentCount?: number;
+  cwd?: string | null;
+  archived?: boolean;
+  pinned?: boolean;
+  lastActive?: number | null;
+  isWorking?: boolean;
+  activityPhase?: string;
+  activityStartedAt?: number;
+  activityHeartbeatAt?: number;
 }
 
 interface CacheData {
@@ -47,35 +68,14 @@ interface CacheData {
   lastSync: number;
 }
 
-// Generate a short, readable title from the first user message (like ChatGPT/Claude)
+// Match WebUI's deterministic first-user fallback. Canonical state.db titles
+// remain authoritative; this is used only when the shared row has no title.
 function generateTitle(message: string): string {
   if (!message || !message.trim())
     return t("sessions.newConversation", getAppLocale());
-
-  // Clean up the message
-  let text = message.trim();
-
-  // Remove markdown formatting
-  text = text.replace(/[#*_`~[\]()]/g, "");
-  // Remove URLs
-  text = text.replace(/https?:\/\/\S+/g, "");
-  // Remove extra whitespace
-  text = text.replace(/\s+/g, " ").trim();
-
+  const text = message.replace(/\n\n\[Attached files: [^\]]+\]$/, "").trim();
   if (!text) return t("sessions.newConversation", getAppLocale());
-
-  // If short enough, use as-is
-  if (text.length <= 50) return text;
-
-  // Take first meaningful chunk — aim for ~40-50 chars at word boundary
-  const words = text.split(" ");
-  let title = "";
-  for (const word of words) {
-    if ((title + " " + word).trim().length > 45) break;
-    title = (title + " " + word).trim();
-  }
-
-  return title || text.slice(0, 45) + "...";
+  return text.slice(0, 64).trimEnd();
 }
 
 function readCache(): CacheData {
@@ -106,6 +106,16 @@ function writeCache(data: CacheData): void {
   }
 }
 
+// Pinned conversations are a separate sidebar section, so they must not be
+// lost behind the first-page limit applied by the renderer. Keep this ordering
+// stable for both the cache-only and DB-sync paths so pagination offsets remain
+// correct after the first page is loaded.
+function orderSidebarRows(rows: CachedSession[]): CachedSession[] {
+  const pinned = rows.filter((session) => session.pinned && !session.archived);
+  const rest = rows.filter((session) => !(session.pinned && !session.archived));
+  return [...pinned, ...rest];
+}
+
 function getDb(): Database.Database | null {
   return getDbConnection(true);
 }
@@ -126,22 +136,25 @@ function attachContextFolders(sessions: CachedSession[]): CachedSession[] {
 export function syncSessionCache(): CachedSession[] {
   const cache = readCache();
   const db = getDb();
-  if (!db) return cache.sessions;
+  if (!db)
+    return orderSidebarRows(cache.sessions.filter(isSharedConversationVisible));
 
   try {
+    const lineageColumns = sessionLineageSelectList(db, "s");
     // Refresh all lightweight metadata before projection. The previous cache
     // already performed an all-session phase for stale counts; fetching the
     // lineage columns in the same O(N) pass also makes pagination correct.
     const rows = db
       .prepare(
-        `SELECT s.id, s.started_at, s.source, s.message_count, s.model, s.title,
-                s.parent_session_id, s.end_reason, s.model_config
+        `SELECT s.id, s.started_at, s.ended_at, s.source, s.message_count, s.model, s.title,
+                ${lineageColumns}
          FROM sessions s
          ORDER BY s.started_at DESC`,
       )
       .all() as Array<{
       id: string;
       started_at: number;
+      ended_at: number | null;
       source: string;
       message_count: number;
       model: string;
@@ -149,6 +162,10 @@ export function syncSessionCache(): CachedSession[] {
       parent_session_id: string | null;
       end_reason: string | null;
       model_config: string | null;
+      archived?: number | boolean | null;
+      pinned?: number | boolean | null;
+      cwd?: string | null;
+      last_activity_at?: number | null;
     }>;
 
     const existingById = new Map(
@@ -160,8 +177,13 @@ export function syncSessionCache(): CachedSession[] {
       const existing = existingById.get(row.id);
       refreshed.push({
         id: row.id,
-        title: row.title || existing?.title || "",
+        // state.db owns shared titles. Do not let a cache-only fallback become
+        // authoritative again after the canonical title was cleared or never
+        // written; the deterministic first-user pass below will regenerate and
+        // backfill the missing value for both clients.
+        title: row.title || "",
         startedAt: row.started_at,
+        endedAt: row.ended_at,
         source: row.source,
         messageCount: row.message_count,
         model: row.model || "",
@@ -169,12 +191,33 @@ export function syncSessionCache(): CachedSession[] {
         parentSessionId: row.parent_session_id,
         endReason: row.end_reason,
         modelConfig: row.model_config,
+        ...(Object.prototype.hasOwnProperty.call(row, "cwd")
+          ? { cwd: row.cwd ?? null }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "archived")
+          ? { archived: Boolean(row.archived) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "pinned")
+          ? { pinned: Boolean(row.pinned) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "last_activity_at")
+          ? { lastActive: row.last_activity_at ?? null }
+          : {}),
       });
     }
 
-    const projected = projectCompressionLineages(
-      attachContextFolders(refreshed),
+    const activity = readSessionActivity(
+      db,
+      refreshed.map((session) => session.id),
     );
+    const projected = applySessionActivity(
+      projectCompressionLineages(attachContextFolders(refreshed)),
+      activity,
+    ).filter(isSharedConversationVisible);
+    const generatedTitleBackfills: Array<{
+      sessionId: string;
+      title: string;
+    }> = [];
     for (const session of projected) {
       if (session.title) continue;
       try {
@@ -184,22 +227,42 @@ export function syncSessionCache(): CachedSession[] {
              WHERE session_id = ? AND role = 'user' AND content IS NOT NULL
              ORDER BY timestamp, id LIMIT 1`,
           )
-          .get(session.id) as { content: string } | undefined;
-        session.title = msg
-          ? generateTitle(msg.content)
-          : t("sessions.newConversation", getAppLocale());
+          .get(session.lineageRootId ?? session.id) as
+          | { content: string }
+          | undefined;
+        if (msg) {
+          session.title = generateTitle(msg.content);
+          generatedTitleBackfills.push({
+            sessionId: session.id,
+            title: session.title,
+          });
+        } else {
+          session.title = t("sessions.newConversation", getAppLocale());
+        }
       } catch {
         session.title = t("sessions.newConversation", getAppLocale());
       }
+    }
+    if (generatedTitleBackfills.length > 0) {
+      updateStateDb((writableDb) => {
+        for (const backfill of generatedTitleBackfills) {
+          updateCompressionLineageField(
+            writableDb,
+            backfill.sessionId,
+            "title",
+            backfill.title,
+          );
+        }
+      });
     }
     const updated: CacheData = {
       sessions: projected,
       lastSync: Math.floor(Date.now() / 1000),
     };
     writeCache(updated);
-    return updated.sessions;
+    return orderSidebarRows(updated.sessions);
   } catch {
-    return cache.sessions;
+    return orderSidebarRows(cache.sessions.filter(isSharedConversationVisible));
   }
 }
 
@@ -209,7 +272,10 @@ export function syncSessionCache(): CachedSession[] {
 // stays current without this path touching the DB.
 export function listCachedSessions(limit = 50, offset = 0): CachedSession[] {
   const cache = readCache();
-  return cache.sessions.slice(offset, offset + limit);
+  return orderSidebarRows(limitSharedConversationRows(cache.sessions)).slice(
+    offset,
+    offset + limit,
+  );
 }
 
 // Update title for a specific session
@@ -230,6 +296,7 @@ export function updateSessionTitle(sessionId: string, title: string): void {
           title,
           sessionId,
         );
+        updateCompressionLineageField(db, sessionId, "title", title);
       } finally {
         db.close();
       }
@@ -237,6 +304,169 @@ export function updateSessionTitle(sessionId: string, title: string): void {
   } catch {
     // ignore DB errors — cache update above is the fast path
   }
+}
+
+function updateStateDb(callback: (db: Database.Database) => void): boolean {
+  try {
+    const dbPath = activeStateDbPath();
+    if (!existsSync(dbPath)) {
+      console.error(`[session-cache] state.db is unavailable at ${dbPath}`);
+      return false;
+    }
+    // Reuse the app's profile-aware connection. This closes a cached
+    // read-only handle before opening the writable one, avoiding a second
+    // connection racing the sidebar's long-lived state.db reader.
+    const db = getDbConnection(false);
+    if (!db) {
+      console.error(
+        `[session-cache] failed to open writable state.db at ${dbPath}`,
+      );
+      return false;
+    }
+    callback(db);
+    return true;
+  } catch (error) {
+    console.error("[session-cache] shared state.db mutation failed", error);
+    return false;
+  }
+}
+
+function updateCompressionLineageField(
+  db: Database.Database,
+  sessionId: string,
+  field: "title" | "archived" | "pinned",
+  value: string | number,
+): void {
+  const columns = new Set(
+    (
+      db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+        name?: unknown;
+      }>
+    )
+      .map((row) => (typeof row.name === "string" ? row.name : ""))
+      .filter(Boolean),
+  );
+  if (
+    !["id", "parent_session_id", "end_reason", "source"].every((column) =>
+      columns.has(column),
+    )
+  ) {
+    if (columns.has(field)) {
+      db.prepare(`UPDATE sessions SET ${field} = ? WHERE id = ?`).run(
+        value,
+        sessionId,
+      );
+    }
+    return;
+  }
+  const branchGuard = columns.has("model_config")
+    ? "(child.model_config IS NULL OR NOT json_valid(child.model_config) OR (COALESCE(json_extract(child.model_config, '$._branched_from'), '') = '' AND COALESCE(json_extract(child.model_config, '$._delegate_from'), '') = ''))"
+    : "1 = 1";
+  const lineageCte = `WITH RECURSIVE lineage(id, source) AS (
+       SELECT id, LOWER(TRIM(COALESCE(source, ''))) FROM sessions WHERE id = ?
+       UNION
+       SELECT parent.id, LOWER(TRIM(COALESCE(parent.source, '')))
+       FROM sessions child
+       JOIN lineage current ON current.id = child.id
+       JOIN sessions parent ON parent.id = child.parent_session_id
+       WHERE parent.end_reason = 'compression'
+         AND LOWER(TRIM(COALESCE(parent.source, ''))) = current.source
+         AND LOWER(TRIM(COALESCE(child.source, ''))) = current.source
+         AND ${branchGuard}
+       UNION
+       SELECT child.id, LOWER(TRIM(COALESCE(child.source, '')))
+       FROM sessions parent
+       JOIN lineage current ON current.id = parent.id
+       JOIN sessions child ON child.parent_session_id = parent.id
+       WHERE parent.end_reason = 'compression'
+         AND LOWER(TRIM(COALESCE(child.source, ''))) = current.source
+         AND LOWER(TRIM(COALESCE(child.source, ''))) <> 'tool'
+         AND ${branchGuard}
+     )`;
+  if (field === "title") {
+    // state.db enforces title uniqueness. Keep one canonical title on the
+    // requested visible segment and clear hidden physical copies in the same
+    // statement; assigning the same title to every segment aborts the write.
+    db.prepare(
+      `${lineageCte}
+       UPDATE sessions
+       SET title = CASE WHEN id = ? THEN ? ELSE NULL END
+       WHERE id IN (SELECT id FROM lineage)`,
+    ).run(sessionId, sessionId, value);
+    return;
+  }
+  db.prepare(
+    `${lineageCte}
+     UPDATE sessions SET ${field} = ?
+     WHERE id IN (SELECT id FROM lineage)`,
+  ).run(sessionId, value);
+}
+
+export function updateSessionWorkspace(sessionId: string, cwd: string): void {
+  const normalized = cwd.trim();
+  if (!normalized) return;
+  if (
+    !updateStateDb((db) => {
+      db.prepare("UPDATE sessions SET cwd = ? WHERE id = ?").run(
+        normalized,
+        sessionId,
+      );
+    })
+  ) {
+    throw new Error(
+      "Shared state.db is unavailable; workspace was not changed.",
+    );
+  }
+  const cache = readCache();
+  const next = cache.sessions.map((session) =>
+    session.id === sessionId ? { ...session, cwd: normalized } : session,
+  );
+  if (next.some((session, index) => session !== cache.sessions[index])) {
+    writeCache({ ...cache, sessions: next });
+  }
+}
+
+export function updateSessionArchived(
+  sessionId: string,
+  archived: boolean,
+): void {
+  if (
+    !updateStateDb((db) => {
+      updateCompressionLineageField(
+        db,
+        sessionId,
+        "archived",
+        archived ? 1 : 0,
+      );
+    })
+  ) {
+    throw new Error(
+      "Shared state.db is unavailable; archive state was not changed.",
+    );
+  }
+  const cache = readCache();
+  const next = cache.sessions.map((session) =>
+    session.id === sessionId ? { ...session, archived } : session,
+  );
+  writeCache({ ...cache, sessions: next });
+}
+
+export function updateSessionPinned(sessionId: string, pinned: boolean): void {
+  if (
+    !updateStateDb((db) => {
+      ensureSharedSessionSchema(db);
+      updateCompressionLineageField(db, sessionId, "pinned", pinned ? 1 : 0);
+    })
+  ) {
+    throw new Error(
+      "Shared state.db is unavailable; pin state was not changed.",
+    );
+  }
+  const cache = readCache();
+  const next = cache.sessions.map((session) =>
+    session.id === sessionId ? { ...session, pinned } : session,
+  );
+  writeCache({ ...cache, sessions: next });
 }
 
 // Remove a session entry from the local cache. Called after the underlying

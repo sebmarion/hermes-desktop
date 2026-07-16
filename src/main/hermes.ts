@@ -2519,12 +2519,17 @@ function sendMessageViaCli(
   });
 
   let hasOutput = false;
-  let capturedSessionId = "";
+  let capturedSessionId = resumeSessionId || "";
   let outputBuffer = "";
+
+  if (capturedSessionId) cb.onSessionStarted?.(capturedSessionId);
 
   function captureSessionId(text: string): void {
     const sidMatch = text.match(/session_id:\s*(\S+)/);
-    if (sidMatch) capturedSessionId = sidMatch[1];
+    if (sidMatch && capturedSessionId !== sidMatch[1]) {
+      capturedSessionId = sidMatch[1];
+      cb.onSessionStarted?.(capturedSessionId);
+    }
   }
 
   function processOutput(raw: Buffer): void {

@@ -698,6 +698,14 @@ const hermesAPI = {
       model: string;
       title: string | null;
       preview: string;
+      archived?: boolean;
+      pinned?: boolean;
+      cwd?: string | null;
+      lastActive?: number | null;
+      isWorking?: boolean;
+      activityPhase?: string;
+      activityStartedAt?: number;
+      activityHeartbeatAt?: number;
     }>
   > => ipcRenderer.invoke("list-sessions", limit, offset),
 
@@ -915,6 +923,14 @@ const hermesAPI = {
       messageCount: number;
       model: string;
       contextFolder: string | null;
+      archived?: boolean;
+      pinned?: boolean;
+      cwd?: string | null;
+      lastActive?: number | null;
+      isWorking?: boolean;
+      activityPhase?: string;
+      activityStartedAt?: number;
+      activityHeartbeatAt?: number;
     }>
   > => ipcRenderer.invoke("list-cached-sessions", limit, offset),
 
@@ -927,11 +943,23 @@ const hermesAPI = {
       messageCount: number;
       model: string;
       contextFolder: string | null;
+      archived?: boolean;
+      cwd?: string | null;
+      lastActive?: number | null;
     }>
   > => ipcRenderer.invoke("sync-session-cache"),
 
+  getSessionRevision: (): Promise<string | null> =>
+    ipcRenderer.invoke("get-session-revision"),
+
   updateSessionTitle: (sessionId: string, title: string): Promise<void> =>
     ipcRenderer.invoke("update-session-title", sessionId, title),
+  updateSessionArchived: (sessionId: string, archived: boolean): Promise<void> =>
+    ipcRenderer.invoke("update-session-archived", sessionId, archived),
+  updateSessionWorkspace: (sessionId: string, cwd: string): Promise<void> =>
+    ipcRenderer.invoke("update-session-workspace", sessionId, cwd),
+  updateSessionPinned: (sessionId: string, pinned: boolean): Promise<void> =>
+    ipcRenderer.invoke("update-session-pinned", sessionId, pinned),
   deleteSession: (sessionId: string): Promise<void> =>
     ipcRenderer.invoke("delete-session", sessionId),
   deleteSessions: (

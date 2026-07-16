@@ -21,8 +21,15 @@ import { deleteSessionContextFolderForSession } from "./session-context-folder-s
 import { deleteSessionModelOverrideForSession } from "./session-model-override-store";
 import {
   buildCompressionLineageProjection,
+  compressionLineageMemberIdsForSession,
+  isSharedConversationVisible,
   projectCompressionLineages,
 } from "./session-lineage";
+import {
+  applySessionActivity,
+  readSessionActivity,
+  sessionLineageSelectList,
+} from "./session-schema";
 
 // Sentinel prefix used by hermes-agent's hermes_state.py to mark
 // JSON-encoded multimodal content in the messages.content column.
@@ -38,8 +45,18 @@ export interface SessionSummary {
   model: string;
   title: string | null;
   preview: string;
+  archived?: boolean;
+  pinned?: boolean;
+  cwd?: string | null;
+  lastActive?: number | null;
+  relationshipType?: string;
   lineageRootId?: string;
+  lineageMemberIds?: string[];
   compressionSegmentCount?: number;
+  isWorking?: boolean;
+  activityPhase?: string;
+  activityStartedAt?: number;
+  activityHeartbeatAt?: number;
 }
 
 export interface SessionMessage {
@@ -205,6 +222,37 @@ export function dedupeSearchRowsBySession<T extends { session_id: string }>(
   return uniqueRows;
 }
 
+function searchSnippetScore(snippet: string): number {
+  const trimmed = snippet.trim();
+  if (!trimmed) return 0;
+  const highlighted = trimmed.includes("<<") && trimmed.includes(">>");
+  return (highlighted ? 1_000 : 0) + Math.min(trimmed.length, 500);
+}
+
+/** Keep result rank stable while retaining a more meaningful later snippet. */
+export function dedupeSearchResultsBySession(
+  rows: readonly SearchResult[],
+  limit: number,
+): SearchResult[] {
+  const uniqueRows: SearchResult[] = [];
+  const indexBySessionId = new Map<string, number>();
+  for (const row of rows) {
+    const existingIndex = indexBySessionId.get(row.sessionId);
+    if (existingIndex === undefined) {
+      indexBySessionId.set(row.sessionId, uniqueRows.length);
+      uniqueRows.push(row);
+      continue;
+    }
+    if (
+      searchSnippetScore(row.snippet) >
+      searchSnippetScore(uniqueRows[existingIndex].snippet)
+    ) {
+      uniqueRows[existingIndex] = row;
+    }
+  }
+  return uniqueRows.slice(0, Math.max(0, limit));
+}
+
 function escapeLikePattern(query: string): string {
   return query.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
@@ -269,6 +317,7 @@ function getDb(readonly = true): Database.Database | null {
 export function listSessions(limit = 30, offset = 0): SessionSummary[] {
   const db = getDb();
   if (!db) return [];
+  const lineageColumns = sessionLineageSelectList(db, "s");
 
   // Read lightweight metadata before paginating so compression continuations
   // cannot occupy multiple slots or straddle page boundaries.
@@ -282,9 +331,7 @@ export function listSessions(limit = 30, offset = 0): SessionSummary[] {
         s.message_count,
         s.model,
         s.title,
-        s.parent_session_id,
-        s.end_reason,
-        s.model_config
+        ${lineageColumns}
       FROM sessions s
       ORDER BY s.started_at DESC`,
     )
@@ -296,25 +343,50 @@ export function listSessions(limit = 30, offset = 0): SessionSummary[] {
     message_count: number;
     model: string;
     title: string | null;
+    pinned?: number | boolean | null;
+    archived?: number | boolean | null;
+    cwd?: string | null;
+    last_activity_at?: number | null;
     parent_session_id: string | null;
     end_reason: string | null;
     model_config: string | null;
   }>;
 
-  return projectCompressionLineages(
-    rows.map((r) => ({
-      id: r.id,
-      source: r.source,
-      startedAt: r.started_at,
-      endedAt: r.ended_at,
-      messageCount: r.message_count,
-      model: r.model || "",
-      title: r.title,
-      preview: "",
-      parentSessionId: r.parent_session_id,
-      endReason: r.end_reason,
-      modelConfig: r.model_config,
-    })),
+  const activity = readSessionActivity(
+    db,
+    rows.map((row) => row.id),
+  );
+  return applySessionActivity(
+    projectCompressionLineages(
+      rows
+        .filter((r) => isSharedConversationVisible(r) || activity.has(r.id))
+        .map((r) => ({
+          id: r.id,
+          source: r.source,
+          startedAt: r.started_at,
+          endedAt: r.ended_at,
+          messageCount: r.message_count,
+          model: r.model || "",
+          title: r.title,
+          preview: "",
+          parentSessionId: r.parent_session_id,
+          endReason: r.end_reason,
+          modelConfig: r.model_config,
+          ...(Object.prototype.hasOwnProperty.call(r, "archived")
+            ? { archived: Boolean(r.archived) }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(r, "pinned")
+            ? { pinned: Boolean(r.pinned) }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(r, "cwd")
+            ? { cwd: r.cwd ?? null }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(r, "last_activity_at")
+            ? { lastActive: r.last_activity_at ?? null }
+            : {}),
+        })),
+    ),
+    activity,
   ).slice(offset, offset + limit);
 }
 
@@ -417,10 +489,21 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
         FROM messages m
         JOIN sessions s ON s.id = m.session_id
         WHERE LOWER(COALESCE(m.content, '')) LIKE ? ESCAPE '\\'
+          AND m.id = (
+            SELECT m2.id
+            FROM messages m2
+            WHERE m2.session_id = m.session_id
+              AND LOWER(COALESCE(m2.content, '')) LIKE ? ESCAPE '\\'
+            ORDER BY LENGTH(COALESCE(m2.content, '')) DESC,
+                     m2.timestamp ASC,
+                     m2.id ASC
+            LIMIT 1
+          )
         ORDER BY s.started_at DESC, m.timestamp ASC, m.id ASC
         LIMIT ?`,
       )
       .all(
+        `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
         `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
         Math.max(limit * 8, 50),
       ) as Array<{
@@ -444,11 +527,12 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
       snippet: decodeSearchSnippet(r.content, r.message_id, trimmedQuery),
     }));
 
+    const lineageColumns = sessionLineageSelectList(db, "s");
     const lineageRows = db
       .prepare(
         `SELECT id, source, started_at, ended_at, message_count, model, title,
-                parent_session_id, end_reason, model_config
-         FROM sessions`,
+                ${lineageColumns}
+         FROM sessions s`,
       )
       .all() as Array<{
       id: string;
@@ -461,6 +545,10 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
       parent_session_id: string | null;
       end_reason: string | null;
       model_config: string | null;
+      pinned?: number | boolean | null;
+      archived?: number | boolean | null;
+      cwd?: string | null;
+      last_activity_at?: number | null;
     }>;
     const lineage = buildCompressionLineageProjection(
       lineageRows.map((row) => ({
@@ -474,36 +562,44 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
         parentSessionId: row.parent_session_id,
         endReason: row.end_reason,
         modelConfig: row.model_config,
+        ...(Object.prototype.hasOwnProperty.call(row, "archived")
+          ? { archived: Boolean(row.archived) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "pinned")
+          ? { pinned: Boolean(row.pinned) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "cwd")
+          ? { cwd: row.cwd ?? null }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(row, "last_activity_at")
+          ? { lastActive: row.last_activity_at ?? null }
+          : {}),
       })),
     );
-    const canonicalMatches = [
+    const canonicalMatches: SearchResult[] = [
       ...titleMatches,
       ...ftsRows,
       ...messageMatches,
-    ].map((row) => {
-      const canonical = lineage.canonicalBySessionId.get(row.session_id);
-      if (!canonical) return row;
-      return {
-        ...row,
-        session_id: canonical.id,
-        title: canonical.title,
-        started_at: canonical.startedAt || row.started_at,
-        source: canonical.source || row.source,
-        message_count: canonical.messageCount ?? row.message_count,
-        model: canonical.model || row.model,
-      };
-    });
-
-    const uniqueRows = dedupeSearchRowsBySession(canonicalMatches, limit);
-    return uniqueRows.map((r) => ({
-      sessionId: r.session_id,
-      title: r.title,
-      startedAt: r.started_at,
-      source: r.source,
-      messageCount: r.message_count,
-      model: r.model || "",
-      snippet: r.snippet || "",
-    }));
+    ]
+      .map((row) => {
+        const canonical = lineage.canonicalBySessionId.get(row.session_id);
+        return {
+          sessionId: canonical?.id ?? row.session_id,
+          title: canonical ? canonical.title : row.title,
+          startedAt: canonical?.startedAt ?? row.started_at,
+          source: canonical ? canonical.source : row.source,
+          messageCount: canonical?.messageCount ?? row.message_count,
+          model: canonical ? canonical.model : row.model || "",
+          snippet: row.snippet || "",
+        };
+      })
+      .filter((row) =>
+        isSharedConversationVisible({
+          source: row.source,
+          messageCount: row.messageCount,
+        }),
+      );
+    return dedupeSearchResultsBySession(canonicalMatches, limit);
   } catch {
     return [];
   }
@@ -735,6 +831,8 @@ export function getSessionMessages(sessionId: string): HistoryItem[] {
   const db = getDb();
   if (!db) return [];
 
+  const canonicalSessionId = resolveSessionTipId(db, sessionId);
+
   const rows = db
     .prepare(
       `SELECT id, role, content, timestamp,
@@ -744,14 +842,55 @@ export function getSessionMessages(sessionId: string): HistoryItem[] {
        WHERE session_id = ? AND role IN ('user', 'assistant', 'tool')
        ORDER BY timestamp, id`,
     )
-    .all(sessionId) as RawMessageRow[];
+    .all(canonicalSessionId) as RawMessageRow[];
 
   const items = expandRowsToHistory(rows);
   const canonical = mergeStoredPromptImageAttachments(
     items,
-    loadPromptImageAttachments(db, sessionId),
+    loadPromptImageAttachments(db, canonicalSessionId),
   );
-  return applySessionLocalOverlays(sessionId, canonical, db);
+  return applySessionLocalOverlays(canonicalSessionId, canonical, db);
+}
+
+function resolveSessionTipId(db: Database.Database, sessionId: string): string {
+  try {
+    const lineageColumns = sessionLineageSelectList(db, "s");
+    const rows = db
+      .prepare(
+        `SELECT s.id, s.source, s.started_at, s.ended_at, s.message_count,
+                s.model, s.title, ${lineageColumns}
+         FROM sessions s`,
+      )
+      .all() as Array<{
+      id: string;
+      source: string;
+      started_at: number;
+      ended_at: number | null;
+      message_count: number | null;
+      model: string | null;
+      title: string | null;
+      parent_session_id?: string | null;
+      end_reason?: string | null;
+      model_config?: string | null;
+    }>;
+    const projection = buildCompressionLineageProjection(
+      rows.map((row) => ({
+        id: row.id,
+        source: row.source,
+        startedAt: row.started_at,
+        endedAt: row.ended_at,
+        messageCount: row.message_count ?? 0,
+        model: row.model || "",
+        title: row.title,
+        parentSessionId: row.parent_session_id,
+        endReason: row.end_reason,
+        modelConfig: row.model_config,
+      })),
+    );
+    return projection.canonicalBySessionId.get(sessionId)?.id ?? sessionId;
+  } catch {
+    return sessionId;
+  }
 }
 
 export function applySessionLocalOverlays(
@@ -830,6 +969,48 @@ function deleteSessionRows(db: Database.Database, sessionId: string): number {
   return result.changes;
 }
 
+function logicalDeletionIds(
+  db: Database.Database,
+  sessionId: string,
+): string[] {
+  if (!hasParentSessionColumn(db)) return [sessionId];
+  try {
+    const lineageColumns = sessionLineageSelectList(db, "s");
+    const rows = db
+      .prepare(
+        `SELECT s.id, s.source, s.started_at, s.ended_at, s.message_count,
+                ${lineageColumns}
+         FROM sessions s`,
+      )
+      .all() as Array<{
+      id: string;
+      source: string;
+      started_at: number;
+      ended_at: number | null;
+      message_count: number;
+      parent_session_id: string | null;
+      end_reason: string | null;
+      model_config: string | null;
+      pinned?: number | boolean | null;
+    }>;
+    return compressionLineageMemberIdsForSession(
+      rows.map((row) => ({
+        id: row.id,
+        source: row.source,
+        startedAt: row.started_at,
+        endedAt: row.ended_at,
+        messageCount: row.message_count,
+        parentSessionId: row.parent_session_id,
+        endReason: row.end_reason,
+        modelConfig: row.model_config,
+      })),
+      sessionId,
+    );
+  } catch {
+    return [sessionId];
+  }
+}
+
 function cleanupDeletedSession(sessionId: string): void {
   clearStagedAttachments(sessionId);
   removeSessionFromCache(sessionId);
@@ -840,15 +1021,19 @@ export function deleteSession(sessionId: string): void {
   if (!id) return;
 
   const db = getDb(false);
+  let deletedIds = [id];
 
   if (db) {
-    const tx = db.transaction((sessionIdToDelete: string) => {
-      deleteSessionRows(db, sessionIdToDelete);
+    deletedIds = logicalDeletionIds(db, id);
+    const tx = db.transaction((sessionIdsToDelete: string[]) => {
+      for (const sessionIdToDelete of sessionIdsToDelete) {
+        deleteSessionRows(db, sessionIdToDelete);
+      }
     });
-    tx(id);
+    tx(deletedIds);
   }
 
-  cleanupDeletedSession(id);
+  for (const deletedId of deletedIds) cleanupDeletedSession(deletedId);
 }
 
 export function deleteSessions(sessionIds: string[]): DeleteSessionsResult {
@@ -856,17 +1041,21 @@ export function deleteSessions(sessionIds: string[]): DeleteSessionsResult {
   let deleted = 0;
 
   const db = getDb(false);
+  let deletionIds = ids;
 
   if (db) {
+    deletionIds = Array.from(
+      new Set(ids.flatMap((id) => logicalDeletionIds(db, id))),
+    );
     const tx = db.transaction((idsToDelete: string[]) => {
       for (const id of idsToDelete) {
         deleted += deleteSessionRows(db, id);
       }
     });
-    tx(ids);
+    tx(deletionIds);
   }
 
-  for (const id of ids) {
+  for (const id of deletionIds) {
     cleanupDeletedSession(id);
   }
 

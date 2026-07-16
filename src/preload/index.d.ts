@@ -515,6 +515,10 @@ interface HermesAPI {
       model: string;
       title: string | null;
       preview: string;
+      archived?: boolean;
+      pinned?: boolean;
+      cwd?: string | null;
+      lastActive?: number | null;
     }>
   >;
   getSessionMessages: (sessionId: string) => Promise<
@@ -715,6 +719,10 @@ interface HermesAPI {
       messageCount: number;
       model: string;
       contextFolder: string | null;
+      archived?: boolean;
+      pinned?: boolean;
+      cwd?: string | null;
+      lastActive?: number | null;
     }>
   >;
   syncSessionCache: () => Promise<
@@ -726,9 +734,19 @@ interface HermesAPI {
       messageCount: number;
       model: string;
       contextFolder: string | null;
+      archived?: boolean;
+      cwd?: string | null;
+      lastActive?: number | null;
     }>
   >;
+  getSessionRevision: () => Promise<string | null>;
   updateSessionTitle: (sessionId: string, title: string) => Promise<void>;
+  updateSessionArchived: (
+    sessionId: string,
+    archived: boolean,
+  ) => Promise<void>;
+  updateSessionWorkspace: (sessionId: string, cwd: string) => Promise<void>;
+  updateSessionPinned: (sessionId: string, pinned: boolean) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
   deleteSessions: (
     sessionIds: string[],

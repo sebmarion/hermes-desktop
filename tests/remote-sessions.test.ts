@@ -8,6 +8,8 @@ import {
   remoteReadMediaAsDataUrl,
   remoteSearchSessions,
   remoteUpdateSessionTitle,
+  remoteUpdateSessionArchived,
+  remoteUpdateSessionWorkspace,
   type RemoteSessionConfig,
 } from "../src/main/remote-sessions";
 
@@ -21,10 +23,12 @@ interface RecordedRequest {
 describe("remote session REST bridge", () => {
   let server: http.Server;
   let baseUrl = "";
+  let scenario = "default";
   const requests: RecordedRequest[] = [];
 
   beforeEach(async () => {
     requests.length = 0;
+    scenario = "default";
     server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -55,6 +59,33 @@ describe("remote session REST bridge", () => {
 
         if (req.url?.startsWith("/api/sessions/search")) {
           const url = new URL(req.url, "http://127.0.0.1");
+          if (url.searchParams.get("q") === "lineage needle") {
+            res.end(
+              JSON.stringify({
+                results: [
+                  {
+                    session_id: "root-search",
+                    source: "chat",
+                    session_started: 10,
+                    message_count: 10,
+                    model: "root-model",
+                    title: "Lineage needle",
+                    snippet: "",
+                  },
+                  {
+                    session_id: "middle-search",
+                    source: "chat",
+                    session_started: 20,
+                    message_count: 8,
+                    model: "middle-model",
+                    snippet:
+                      "The best meaningful <<lineage needle>> snippet from an old segment",
+                  },
+                ],
+              }),
+            );
+            return;
+          }
           if (url.searchParams.get("q") === "duck") {
             res.end(
               JSON.stringify({
@@ -86,6 +117,308 @@ describe("remote session REST bridge", () => {
               model: "deepseek/deepseek-v4-pro",
               title: "Duck search session",
               preview: "duck in bath",
+            }),
+          );
+          return;
+        }
+
+        if (req.url === "/api/sessions/root-search") {
+          res.end(
+            JSON.stringify({
+              id: "root-search",
+              source: "chat",
+              started_at: 10,
+              message_count: 10,
+              model: "root-model",
+              title: "Lineage needle",
+            }),
+          );
+          return;
+        }
+
+        if (req.url === "/api/sessions/middle-search") {
+          res.end(
+            JSON.stringify({
+              id: "middle-search",
+              source: "chat",
+              started_at: 20,
+              message_count: 8,
+              model: "middle-model",
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+            "/api/profiles/sessions?limit=200&offset=0&min_messages=0&archived=exclude&order=recent&profile=all" &&
+          scenario === "cached-lineage-list"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "live-child",
+                  parent_session_id: "root-cached",
+                  source: "chat",
+                  started_at: 20,
+                  message_count: 5,
+                  model: "live-model",
+                  title: null,
+                },
+                {
+                  id: "closed-orphan",
+                  parent_session_id: "root-cached",
+                  source: "chat",
+                  started_at: 30,
+                  ended_at: 40,
+                  end_reason: "ws_orphan_reap",
+                  message_count: 7,
+                  model: "orphan-model",
+                  title: null,
+                },
+                {
+                  id: "root-cached",
+                  source: "chat",
+                  started_at: 10,
+                  ended_at: 15,
+                  end_reason: "compression",
+                  message_count: 10,
+                  model: "root-model",
+                  title: "Root-owned cached title",
+                },
+              ],
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+            "/api/profiles/sessions?limit=200&offset=0&min_messages=0&archived=exclude&order=recent&profile=all" &&
+          scenario === "mixed-endpoint-lineage"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "modern-root",
+                  source: "chat",
+                  started_at: 1,
+                  ended_at: 2,
+                  end_reason: "compression",
+                  message_count: 1,
+                  model: "modern-model",
+                  title: "Modern root",
+                },
+                ...Array.from({ length: 199 }, (_, index) => ({
+                  id: `modern-independent-${index}`,
+                  source: "chat",
+                  started_at: 100 + index,
+                  ended_at: null,
+                  parent_session_id: null,
+                  end_reason: null,
+                  model_config: null,
+                  message_count: 1,
+                  model: "modern-model",
+                  title: `Modern independent ${index}`,
+                })),
+              ],
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+            "/api/profiles/sessions?limit=200&offset=200&min_messages=0&archived=exclude&order=recent&profile=all" &&
+          scenario === "mixed-endpoint-lineage"
+        ) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ detail: "modern page failed" }));
+          return;
+        }
+
+        if (
+          req.url ===
+            "/api/sessions?limit=200&offset=200&archived=exclude&order=recent" &&
+          scenario === "mixed-endpoint-lineage"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "legacy-ghost",
+                  source: "chat",
+                  started_at: 9999,
+                  message_count: 1,
+                  model: "legacy-model",
+                  title: "Must not mix into modern lineage rows",
+                },
+              ],
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+            "/api/profiles/sessions?limit=1&offset=0&min_messages=0&archived=exclude&order=recent&profile=all" &&
+          scenario === "mixed-endpoint-lineage"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "modern-root",
+                  source: "chat",
+                  started_at: 1,
+                  ended_at: 2,
+                  end_reason: "compression",
+                  message_count: 1,
+                  model: "modern-model",
+                  title: "Modern root",
+                },
+              ],
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+          "/api/profiles/sessions?limit=200&offset=0&min_messages=0&archived=exclude&order=recent&profile=all"
+        ) {
+          const sessions =
+            scenario === "activity-list"
+              ? [
+                  {
+                    id: "working",
+                    source: "chat",
+                    started_at: 1700000000,
+                    message_count: 3,
+                    model: "test-model",
+                    title: "Working task",
+                    is_working: true,
+                    activity_phase: "tool",
+                    activity_started_at: 1700000000,
+                    activity_heartbeat_at: 1700000005,
+                  },
+                ]
+              : scenario === "compression-list"
+              ? [
+                  {
+                    id: "tip",
+                    parent_session_id: "root",
+                    source: "chat",
+                    started_at: 30,
+                    message_count: 5,
+                    model: "test-model",
+                    title: null,
+                  },
+                  {
+                    id: "root",
+                    source: "chat",
+                    started_at: 10,
+                    message_count: 10,
+                    model: "test-model",
+                    title: "Remote logical conversation",
+                    end_reason: "compression",
+                  },
+                  {
+                    id: "branch",
+                    parent_session_id: "root",
+                    source: "chat",
+                    started_at: 20,
+                    message_count: 3,
+                    model: "test-model",
+                    title: "Remote branch",
+                    model_config: JSON.stringify({ _branched_from: "root" }),
+                  },
+                ]
+              : [
+                  {
+                    id: "newer-page-row",
+                    source: "chat",
+                    started_at: 50,
+                    message_count: 2,
+                    model: "other-model",
+                    title: "Newer",
+                    parent_session_id: null,
+                    end_reason: null,
+                    model_config: null,
+                  },
+                  {
+                    id: "tip-search",
+                    source: "chat",
+                    started_at: 30,
+                    message_count: 3,
+                    model: "tip-model",
+                    title: null,
+                    parent_session_id: "middle-search",
+                    end_reason: null,
+                    model_config: null,
+                  },
+                  {
+                    id: "middle-search",
+                    source: "chat",
+                    started_at: 20,
+                    message_count: 8,
+                    model: "middle-model",
+                    title: null,
+                    parent_session_id: "root-search",
+                    end_reason: "compression",
+                    model_config: null,
+                  },
+                  {
+                    id: "root-search",
+                    source: "chat",
+                    started_at: 10,
+                    message_count: 10,
+                    model: "root-model",
+                    title: "Lineage needle",
+                    parent_session_id: null,
+                    end_reason: "compression",
+                    model_config: null,
+                  },
+                  {
+                    id: "older-page-row",
+                    source: "chat",
+                    started_at: 5,
+                    message_count: 1,
+                    model: "older-model",
+                    title: "Older",
+                    parent_session_id: null,
+                    end_reason: null,
+                    model_config: null,
+                  },
+                ];
+          res.end(
+            JSON.stringify({
+              sessions,
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+          "/api/profiles/sessions?limit=1&offset=2&min_messages=0&archived=exclude&order=recent&profile=all"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "middle-search",
+                  source: "chat",
+                  started_at: 20,
+                  message_count: 8,
+                  model: "middle-model",
+                  parent_session_id: "root-search",
+                  end_reason: "compression",
+                  model_config: null,
+                },
+              ],
             }),
           );
           return;
@@ -149,6 +482,39 @@ describe("remote session REST bridge", () => {
                   model: "codex-cli/gpt-5.5",
                   title: null,
                   preview: "Remote preview",
+                },
+              ],
+            }),
+          );
+          return;
+        }
+
+        if (
+          req.url ===
+            "/api/profiles/sessions?limit=50&offset=0&min_messages=0&archived=exclude&order=recent&profile=all" &&
+          scenario === "cached-lineage-list"
+        ) {
+          res.end(
+            JSON.stringify({
+              sessions: [
+                {
+                  id: "live-child",
+                  parent_session_id: "root-cached",
+                  source: "chat",
+                  started_at: 20,
+                  message_count: 5,
+                  model: "live-model",
+                  title: null,
+                },
+                {
+                  id: "root-cached",
+                  source: "chat",
+                  started_at: 10,
+                  ended_at: 15,
+                  end_reason: "compression",
+                  message_count: 10,
+                  model: "root-model",
+                  title: "Root-owned cached title",
                 },
               ],
             }),
@@ -336,6 +702,7 @@ describe("remote session REST bridge", () => {
     expect(sessions).toEqual([
       {
         id: "sess-list",
+        lineageMemberIds: ["sess-list"],
         source: "chat",
         startedAt: 1700000000,
         endedAt: null,
@@ -347,7 +714,21 @@ describe("remote session REST bridge", () => {
     ]);
   });
 
+  it("preserves shared activity fields from the remote WebUI", async () => {
+    scenario = "activity-list";
+    const sessions = await remoteListSessions(config(), 200, 0);
+
+    expect(sessions[0]).toMatchObject({
+      id: "working",
+      isWorking: true,
+      activityPhase: "tool",
+      activityStartedAt: 1700000000,
+      activityHeartbeatAt: 1700000005,
+    });
+  });
+
   it("collapses remote compression rows while preserving marked branches", async () => {
+    scenario = "compression-list";
     const sessions = await remoteListSessions(config(), 3, 0);
 
     expect(sessions.map((session) => session.id)).toEqual(["tip", "branch"]);
@@ -358,6 +739,13 @@ describe("remote session REST bridge", () => {
       lineageRootId: "root",
       compressionSegmentCount: 2,
     });
+  });
+
+  it("applies remote pagination after compression collapse", async () => {
+    scenario = "pagination-list";
+    const sessions = await remoteListSessions(config(), 1, 2);
+
+    expect(sessions.map((session) => session.id)).toEqual(["older-page-row"]);
   });
 
   it("falls back to the legacy session endpoint", async () => {
@@ -422,6 +810,36 @@ describe("remote session REST bridge", () => {
         contextFolder: null,
       },
     ]);
+  });
+
+  it("projects cached rows before fallbacks and keeps endedAt tip-owned", async () => {
+    scenario = "cached-lineage-list";
+
+    const sessions = await remoteListCachedSessions(config());
+
+    expect(sessions).toEqual([
+      expect.objectContaining({
+        id: "live-child",
+        title: "Root-owned cached title",
+        model: "live-model",
+        lineageRootId: "root-cached",
+        compressionSegmentCount: 3,
+      }),
+    ]);
+    expect(sessions[0]).not.toHaveProperty("endedAt");
+  });
+
+  it("never mixes legacy fallback pages into a modern lineage scan", async () => {
+    scenario = "mixed-endpoint-lineage";
+
+    const sessions = await remoteListSessions(config(), 1, 0);
+
+    expect(sessions.map((session) => session.id)).toEqual(["modern-root"]);
+    expect(
+      requests.some((request) =>
+        request.url.startsWith("/api/sessions?limit=200&offset=200"),
+      ),
+    ).toBe(false);
   });
 
   it("expands remote stored messages into rich history items", async () => {
@@ -529,6 +947,22 @@ describe("remote session REST bridge", () => {
     ]);
   });
 
+  it("redirects remote old-segment hits to one tip and keeps the best snippet", async () => {
+    scenario = "lineage-search";
+    const results = await remoteSearchSessions(config(), "lineage needle", 2);
+
+    expect(results).toEqual([
+      expect.objectContaining({
+        sessionId: "tip-search",
+        title: "Lineage needle",
+        startedAt: 30,
+        messageCount: 3,
+        model: "tip-model",
+        snippet: expect.stringContaining("best meaningful"),
+      }),
+    ]);
+  });
+
   it("falls back to recent transcript scanning when remote search misses a session", async () => {
     const results = await remoteSearchSessions(config(), "Thinking aloud");
 
@@ -550,8 +984,10 @@ describe("remote session REST bridge", () => {
     ]);
   });
 
-  it("sends title updates and deletes to the remote backend", async () => {
+  it("sends shared metadata updates and deletes to the remote backend", async () => {
     await remoteUpdateSessionTitle(config(), "sess-title", "New title");
+    await remoteUpdateSessionArchived(config(), "sess-title", true);
+    await remoteUpdateSessionWorkspace(config(), "sess-title", "/workspace");
     await remoteDeleteSession(config(), "sess-delete");
 
     expect(requests[0]).toMatchObject({
@@ -561,6 +997,16 @@ describe("remote session REST bridge", () => {
       body: JSON.stringify({ title: "New title" }),
     });
     expect(requests[1]).toMatchObject({
+      method: "PATCH",
+      url: "/api/sessions/sess-title",
+      body: JSON.stringify({ archived: true }),
+    });
+    expect(requests[2]).toMatchObject({
+      method: "PATCH",
+      url: "/api/sessions/sess-title",
+      body: JSON.stringify({ cwd: "/workspace" }),
+    });
+    expect(requests[3]).toMatchObject({
       method: "DELETE",
       url: "/api/sessions/sess-delete",
       token: "test-token",
