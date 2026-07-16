@@ -39,6 +39,11 @@ import {
   setSessionModelOverride,
 } from "../session-model-override-store";
 import {
+  startLocalSessionActivity,
+  type LocalSessionActivityHandle,
+} from "../session-activity";
+import { getActiveSessionRevision } from "../session-revision";
+import {
   materializeDataUrlToTemp,
   readMediaAsDataUrl,
   saveMedia,
@@ -195,6 +200,9 @@ import {
   syncSessionCache,
   listCachedSessions,
   updateSessionTitle,
+  updateSessionArchived,
+  updateSessionWorkspace,
+  updateSessionPinned,
 } from "../session-cache";
 import {
   remoteDeleteSession,
@@ -205,6 +213,9 @@ import {
   remoteReadMediaAsDataUrl,
   remoteSearchSessions,
   remoteUpdateSessionTitle,
+  remoteUpdateSessionArchived,
+  remoteUpdateSessionWorkspace,
+  remoteUpdateSessionPinned,
   type RemoteSessionConfig,
 } from "../remote-sessions";
 import {
@@ -388,6 +399,10 @@ import {
   sshGetPlatformEnabled,
   sshSetPlatformEnabled,
   sshListCachedSessions,
+  sshUpdateSessionArchived,
+  sshUpdateSessionTitle,
+  sshUpdateSessionWorkspace,
+  sshUpdateSessionPinned,
   sshRunDoctor,
   sshListModels,
   sshAddModel,
@@ -657,6 +672,12 @@ export function registerIpcHandlers(context: IpcContext): void {
     openExternalUrl,
   } = context;
   const mainWindow = getMainWindow();
+  const localActivityHandles = new Map<string, LocalSessionActivityHandle>();
+
+  const stopLocalActivity = (runId: string): void => {
+    localActivityHandles.get(runId)?.stop();
+    localActivityHandles.delete(runId);
+  };
   // Installation
   ipcMain.handle("check-install", () => {
     return checkInstallStatus();
@@ -1398,7 +1419,10 @@ export function registerIpcHandlers(context: IpcContext): void {
       // conversation). Sibling runs — other background sessions / agents —
       // keep streaming untouched.
       const existing = activeRuns.get(chatRunId);
-      if (existing) existing();
+      if (existing) {
+        existing();
+        stopLocalActivity(chatRunId);
+      }
 
       let fullResponse = "";
       const chatStartTime = Date.now();
@@ -1429,6 +1453,28 @@ export function registerIpcHandlers(context: IpcContext): void {
       };
       const abortThisRun = (): void => {
         activeRuns.get(chatRunId)?.();
+        stopLocalActivity(chatRunId);
+      };
+
+      let localActivitySessionId = "";
+      const setLocalActivity = (sessionId: string, phase: string): void => {
+        if (conn.mode !== "local") return;
+        const normalizedId = String(sessionId || "").trim();
+        if (!normalizedId) return;
+        const existingHandle = localActivityHandles.get(chatRunId);
+        if (existingHandle && localActivitySessionId === normalizedId) {
+          existingHandle.setPhase(phase);
+          return;
+        }
+        stopLocalActivity(chatRunId);
+        localActivitySessionId = normalizedId;
+        localActivityHandles.set(
+          chatRunId,
+          startLocalSessionActivity(normalizedId, chatRunId, {
+            profile,
+            phase,
+          }),
+        );
       };
 
       const handle = await sendMessage(
@@ -1450,9 +1496,11 @@ export function registerIpcHandlers(context: IpcContext): void {
             if (!safeSend("chat-reasoning-chunk", chunk)) {
               abortThisRun();
             }
+            setLocalActivity(localActivitySessionId, "thinking");
           },
           onDone: (sessionId) => {
             activeRuns.delete(chatRunId);
+            stopLocalActivity(chatRunId);
             try {
               persistPromptImageAttachments(sessionId, message, attachments);
             } catch (err) {
@@ -1480,10 +1528,12 @@ export function registerIpcHandlers(context: IpcContext): void {
             }
           },
           onSessionStarted: (sessionId) => {
+            setLocalActivity(sessionId, "running");
             safeSend("chat-session-started", sessionId);
           },
           onError: (error) => {
             activeRuns.delete(chatRunId);
+            stopLocalActivity(chatRunId);
             safeSend("chat-error", error);
             rejectChat(new Error(error));
             // Notify on error too if window not focused
@@ -1495,15 +1545,18 @@ export function registerIpcHandlers(context: IpcContext): void {
             }
           },
           onToolProgress: (tool) => {
+            setLocalActivity(localActivitySessionId, "tool");
             safeSend("chat-tool-progress", tool);
           },
           onToolEvent: (toolEvent) => {
+            setLocalActivity(localActivitySessionId, "tool");
             safeSend("chat-tool-event", toolEvent);
           },
           onUsage: (usage) => {
             safeSend("chat-usage", usage);
           },
           onClarify: (req) => {
+            setLocalActivity(localActivitySessionId, "clarification");
             safeSend("chat-clarify-request", req);
           },
         },
@@ -1525,9 +1578,13 @@ export function registerIpcHandlers(context: IpcContext): void {
     if (runId) {
       activeRuns.get(runId)?.();
       activeRuns.delete(runId);
+      stopLocalActivity(runId);
       return;
     }
-    for (const abort of activeRuns.values()) abort();
+    for (const [runId, abort] of activeRuns.entries()) {
+      abort();
+      stopLocalActivity(runId);
+    }
     activeRuns.clear();
   });
 
@@ -2274,11 +2331,11 @@ export function registerIpcHandlers(context: IpcContext): void {
     (_event, limit?: number, offset?: number) => {
       const conn = getConnectionConfig();
       if (conn.mode === "remote")
-        return remoteListCachedSessions(conn, limit, offset);
+        return remoteListCachedSessions(conn, limit, offset, true);
       if (conn.mode === "ssh" && conn.ssh)
         return withSshDashboardSessions(
           conn,
-          (config) => remoteListCachedSessions(config, limit, offset),
+          (config) => remoteListCachedSessions(config, limit, offset, true),
           () => sshListCachedSessions(conn.ssh, limit, offset),
           activeSshProfile(),
         );
@@ -2287,11 +2344,11 @@ export function registerIpcHandlers(context: IpcContext): void {
   );
   ipcMain.handle("sync-session-cache", () => {
     const conn = getConnectionConfig();
-    if (conn.mode === "remote") return remoteListCachedSessions(conn, 50);
+    if (conn.mode === "remote") return remoteListCachedSessions(conn, 50, 0, true);
     if (conn.mode === "ssh" && conn.ssh)
       return withSshDashboardSessions(
         conn,
-        (config) => remoteListCachedSessions(config, 50),
+        (config) => remoteListCachedSessions(config, 50, 0, true),
         () => sshListCachedSessions(conn.ssh, 50),
         activeSshProfile(),
       );
@@ -2301,6 +2358,12 @@ export function registerIpcHandlers(context: IpcContext): void {
       console.error("sync-session-cache failed; using local cache", error);
       return listCachedSessions(50);
     }
+  });
+  ipcMain.handle("get-session-revision", () => {
+    // Remote/SSH deployments may not yet expose the cheap revision contract.
+    // Returning null makes the renderer use its bounded 30-second fallback.
+    if (getConnectionConfig().mode !== "local") return null;
+    return getActiveSessionRevision();
   });
   ipcMain.handle(
     "update-session-title",
@@ -2312,10 +2375,66 @@ export function registerIpcHandlers(context: IpcContext): void {
         return withSshDashboardSessions(
           conn,
           (config) => remoteUpdateSessionTitle(config, sessionId, title),
-          undefined,
+          () =>
+            sshUpdateSessionTitle(
+              conn.ssh!,
+              sessionId,
+              title,
+              activeSshProfile(),
+            ),
           activeSshProfile(),
         );
       return updateSessionTitle(sessionId, title);
+    },
+  );
+  ipcMain.handle(
+    "update-session-archived",
+    (_event, sessionId: string, archived: boolean) => {
+      const conn = getConnectionConfig();
+      if (conn.mode === "remote")
+        return remoteUpdateSessionArchived(conn, sessionId, Boolean(archived));
+      if (conn.mode === "ssh" && conn.ssh)
+        return withSshDashboardSessions(
+          conn,
+          (config) =>
+            remoteUpdateSessionArchived(config, sessionId, Boolean(archived)),
+          () =>
+            sshUpdateSessionArchived(conn.ssh!, sessionId, Boolean(archived)),
+        );
+      return updateSessionArchived(sessionId, Boolean(archived));
+    },
+  );
+  ipcMain.handle(
+    "update-session-workspace",
+    (_event, sessionId: string, cwd: string) => {
+      const normalized = typeof cwd === "string" ? cwd.trim() : "";
+      if (!normalized) throw new Error("Agent workspace must not be empty.");
+      const conn = getConnectionConfig();
+      if (conn.mode === "remote")
+        return remoteUpdateSessionWorkspace(conn, sessionId, normalized);
+      if (conn.mode === "ssh" && conn.ssh)
+        return withSshDashboardSessions(
+          conn,
+          (config) => remoteUpdateSessionWorkspace(config, sessionId, normalized),
+          () => sshUpdateSessionWorkspace(conn.ssh!, sessionId, normalized),
+        );
+      return updateSessionWorkspace(sessionId, normalized);
+    },
+  );
+  ipcMain.handle(
+    "update-session-pinned",
+    (_event, sessionId: string, pinned: boolean) => {
+      const conn = getConnectionConfig();
+      if (conn.mode === "remote")
+        return remoteUpdateSessionPinned(conn, sessionId, Boolean(pinned));
+      if (conn.mode === "ssh" && conn.ssh)
+        return withSshDashboardSessions(
+          conn,
+          (config) =>
+            remoteUpdateSessionPinned(config, sessionId, Boolean(pinned)),
+          () => sshUpdateSessionPinned(conn.ssh!, sessionId, Boolean(pinned)),
+        );
+      return updateSessionPinned(sessionId, Boolean(pinned));
     },
   );
 

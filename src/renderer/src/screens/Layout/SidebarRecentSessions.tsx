@@ -23,20 +23,26 @@ import SidebarSessionMenu, {
   type SidebarMenuProject,
   type SidebarMenuTarget,
 } from "./SidebarSessionMenu";
+import {
+  attachSidebarChildSessions,
+  type SidebarSessionRow,
+} from "./sidebar-session-tree";
+import { useSessionRevisionPoll } from "./use-session-revision-poll";
 
-interface RecentSession {
+interface RecentSession extends SidebarSessionRow {
   id: string;
   title: string;
   contextFolder?: string | null;
+  cwd?: string | null;
+  archived?: boolean;
+  pinned?: boolean;
+  isWorking?: boolean;
+  activityPhase?: string;
+  children?: RecentSession[];
 }
 
 // ChatGPT-style paged conversation list under the pinned app navigation.
 export const RECENT_SESSIONS_PAGE_SIZE = 30;
-
-// Re-sync cadence while the list is visible. Deliberately slower than the
-// Sessions screen (30s) — the sidebar is always on screen, so this interval
-// runs for the whole app lifetime when the section is expanded.
-const RECENT_REFRESH_MS = 60_000;
 
 // Minimum gap between event-driven refreshes (focus, session switch) so a
 // burst of focus/blur events doesn't hammer state.db.
@@ -46,9 +52,27 @@ const PROJECTS_OPEN_KEY = "hermes.sidebar.projectsOpen";
 const CHATS_OPEN_KEY = "hermes.sidebar.chatsOpen";
 const FOLDERS_CLOSED_KEY = "hermes.sidebar.closedProjectFolders";
 const PINNED_OPEN_KEY = "hermes.sidebar.pinnedOpen";
-// Pinned session ids live in localStorage like the disclosure state — pinning
-// is a desktop-only UI affordance, not part of the agent session schema.
+// Legacy localStorage key retained only for one-time migration into state.db.
 const PINNED_IDS_KEY = "hermes.sidebar.pinnedSessions";
+const SIDEBAR_IMPORTED_SOURCES = new Set([
+  "cli",
+  "tui",
+  "acp",
+  "external_agent",
+  "external-agent",
+  "claude_code",
+]);
+const SIDEBAR_IMPORTED_LIMIT = 20;
+
+function limitSidebarRows<T extends { source?: string }>(list: T[]): T[] {
+  let imported = 0;
+  return list.filter((row) => {
+    const source = String(row.source || "").trim().toLowerCase();
+    if (!SIDEBAR_IMPORTED_SOURCES.has(source)) return true;
+    imported += 1;
+    return imported <= SIDEBAR_IMPORTED_LIMIT;
+  });
+}
 
 function readStoredPinned(): Set<string> {
   try {
@@ -57,14 +81,6 @@ function readStoredPinned(): Set<string> {
     return new Set(Array.isArray(parsed) ? parsed.filter(String) : []);
   } catch {
     return new Set();
-  }
-}
-
-function storePinned(ids: Set<string>): void {
-  try {
-    localStorage.setItem(PINNED_IDS_KEY, JSON.stringify(Array.from(ids)));
-  } catch {
-    /* ignore persistence failures */
   }
 }
 
@@ -101,6 +117,11 @@ function sameSessions(a: RecentSession[], b: RecentSession[]): boolean {
       a[i].id !== b[i].id ||
       a[i].title !== b[i].title ||
       (a[i].contextFolder ?? null) !== (b[i].contextFolder ?? null)
+      || (a[i].cwd ?? null) !== (b[i].cwd ?? null)
+      || Boolean(a[i].archived) !== Boolean(b[i].archived)
+      || Boolean(a[i].pinned) !== Boolean(b[i].pinned)
+      || (a[i].parentSessionId ?? null) !== (b[i].parentSessionId ?? null)
+      || (a[i].relationshipType ?? null) !== (b[i].relationshipType ?? null)
     ) {
       return false;
     }
@@ -113,7 +134,10 @@ function folderName(path: string): string {
   return parts.at(-1) || path;
 }
 
-function groupSessionsByWorkspace(sessions: RecentSession[]): {
+function groupSessionsByWorkspace(
+  sessions: RecentSession[],
+  treeReady = false,
+): {
   projectGroups: Array<{
     path: string;
     name: string;
@@ -124,7 +148,7 @@ function groupSessionsByWorkspace(sessions: RecentSession[]): {
   const projects = new Map<string, RecentSession[]>();
   const chats: RecentSession[] = [];
 
-  for (const session of sessions) {
+  for (const session of treeReady ? sessions : attachSidebarChildSessions(sessions)) {
     const contextFolder = session.contextFolder?.trim();
     if (!contextFolder) {
       chats.push(session);
@@ -154,8 +178,9 @@ function groupSessionsByWorkspace(sessions: RecentSession[]): {
  * Fetch strategy, cheapest first:
  *  - on open: instant read from the sessions.json cache (no DB), then one
  *    sync against state.db to pick up sessions created since the last sync
- *  - while open: refresh on window focus and on a slow interval, throttled
- *  - closed (collapsed section or icon-only sidebar): zero work, renders null
+ *  - always: poll a cheap state.db revision and rebuild only after a commit
+ *  - while open: refresh on focus and direct UI events, throttled
+ *  - closed (collapsed section or icon-only sidebar): revision checks only
  */
 const SidebarRecentSessions = memo(function SidebarRecentSessions({
   open,
@@ -195,9 +220,6 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
   const [closedProjectFolders, setClosedProjectFolders] = useState<Set<string>>(
     () => readStoredClosedFolders(),
   );
-  const [pinnedIds, setPinnedIds] = useState<Set<string>>(() =>
-    readStoredPinned(),
-  );
   const [pinnedOpen, setPinnedOpen] = useState(() =>
     readStoredOpen(PINNED_OPEN_KEY),
   );
@@ -228,23 +250,34 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     editingIdRef.current = editingId;
   }, [editingId]);
 
-  useEffect(() => {
-    storePinned(pinnedIds);
-  }, [pinnedIds]);
-
   const normalizeRows = useCallback(
     (
       list: Array<{
         id: string;
         title: string;
+        source?: string;
         contextFolder?: string | null;
+        cwd?: string | null;
+        archived?: boolean;
+        pinned?: boolean;
+        isWorking?: boolean;
+        activityPhase?: string;
+        parentSessionId?: string | null;
+        relationshipType?: string;
       }>,
       limit = RECENT_SESSIONS_PAGE_SIZE,
     ): RecentSession[] =>
-      list.slice(0, limit).map(({ id, title, contextFolder }) => ({
+      limitSidebarRows(list).slice(0, limit).map(({ id, title, contextFolder, cwd, archived, pinned, isWorking, activityPhase, parentSessionId, relationshipType }) => ({
         id,
         title,
         contextFolder: contextFolder ?? null,
+        cwd: cwd ?? null,
+        archived: Boolean(archived),
+        pinned: Boolean(pinned),
+        isWorking: Boolean(isWorking),
+        activityPhase: activityPhase ?? undefined,
+        parentSessionId: parentSessionId ?? null,
+        relationshipType,
       })),
     [],
   );
@@ -254,7 +287,15 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       list: Array<{
         id: string;
         title: string;
+        source?: string;
         contextFolder?: string | null;
+        cwd?: string | null;
+        archived?: boolean;
+        pinned?: boolean;
+        isWorking?: boolean;
+        activityPhase?: string;
+        parentSessionId?: string | null;
+        relationshipType?: string;
       }>,
     ): void => {
       setHasMore(list.length > RECENT_SESSIONS_PAGE_SIZE);
@@ -271,7 +312,15 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       list: Array<{
         id: string;
         title: string;
+        source?: string;
         contextFolder?: string | null;
+        cwd?: string | null;
+        archived?: boolean;
+        pinned?: boolean;
+        isWorking?: boolean;
+        activityPhase?: string;
+        parentSessionId?: string | null;
+        relationshipType?: string;
       }>,
     ): void => {
       const loadedLimit = Math.max(
@@ -290,7 +339,13 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       list: Array<{
         id: string;
         title: string;
+        source?: string;
         contextFolder?: string | null;
+        cwd?: string | null;
+        archived?: boolean;
+        pinned?: boolean;
+        parentSessionId?: string | null;
+        relationshipType?: string;
       }>,
     ): void => {
       setHasMore(list.length > RECENT_SESSIONS_PAGE_SIZE);
@@ -322,6 +377,39 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     },
     [applyLoadedWindow],
   );
+
+  // This hook is deliberately independent of `open`: Layout remains mounted
+  // across app routes, so collapsed, off-route, and minimized windows continue
+  // observing cheap state.db revisions without rebuilding the full list while
+  // idle. A real commit triggers exactly one cache sync.
+  useSessionRevisionPoll({
+    profile: activeProfile,
+    onChange: () => refresh(true),
+  });
+
+  // Migrate pins created by older Hermes One builds into the shared state.db
+  // once. The API routes this to the Mac server in remote mode.
+  useEffect(() => {
+    const legacyIds = readStoredPinned();
+    if (legacyIds.size === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        for (const id of legacyIds) {
+          await window.hermesAPI.updateSessionPinned(id, true);
+        }
+        if (!cancelled) {
+          localStorage.removeItem(PINNED_IDS_KEY);
+          void refresh(true);
+        }
+      } catch {
+        // Keep the legacy key so a transient remote/DB failure retries later.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [refresh]);
 
   const loadNextPage = useCallback(async (): Promise<void> => {
     if (!open || !hasMoreRef.current || loadingMoreRef.current) return;
@@ -380,11 +468,11 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     };
   }, [open, activeProfile, applyFirstPage]);
 
-  // While open: pick up background sessions (gateway, cron, other devices)
-  // on focus and on a slow timer. No listeners or timers at all when closed.
+  // Focus and direct UI events complement the always-on revision poll with an
+  // immediate foreground refresh. The expensive periodic full-sync timer was
+  // removed; idle local windows now perform revision reads only.
   useEffect(() => {
     if (!open) return;
-    const timer = setInterval(() => void refresh(), RECENT_REFRESH_MS);
     const onFocus = (): void => {
       void refresh();
     };
@@ -397,7 +485,6 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
       onContextFolderChanged,
     );
     return () => {
-      clearInterval(timer);
       window.removeEventListener("focus", onFocus);
       window.removeEventListener(
         "hermes-session-context-folder-changed",
@@ -449,14 +536,29 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
 
   // Pinned rows are pulled out of the normal grouping and shown in their own
   // section at the top (ChatGPT-style), preserving recency order.
+  const activeSessions = useMemo(
+    () => sessions.filter((s) => !s.archived),
+    [sessions],
+  );
+  const archivedSessions = useMemo(
+    () => sessions.filter((s) => s.archived),
+    [sessions],
+  );
+  const activeSessionTree = useMemo(
+    () => attachSidebarChildSessions(activeSessions),
+    [activeSessions],
+  );
   const pinnedSessions = useMemo(
-    () => sessions.filter((s) => pinnedIds.has(s.id)),
-    [sessions, pinnedIds],
+    () => activeSessionTree.filter((s) => s.pinned),
+    [activeSessionTree],
   );
   const { projectGroups, chats } = useMemo(
     () =>
-      groupSessionsByWorkspace(sessions.filter((s) => !pinnedIds.has(s.id))),
-    [sessions, pinnedIds],
+      groupSessionsByWorkspace(
+        activeSessionTree.filter((s) => !s.pinned),
+        true,
+      ),
+    [activeSessionTree],
   );
 
   // Every distinct project folder currently in use, so "Move to project" lists
@@ -484,14 +586,23 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     });
   };
 
-  const handleTogglePin = useCallback((id: string): void => {
-    setPinnedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
+  const handleTogglePin = useCallback(async (id: string): Promise<void> => {
+    const current = sessionsRef.current.find((s) => s.id === id);
+    if (!current) return;
+    const pinned = !current.pinned;
+    setSessions((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, pinned } : s)),
+    );
+    try {
+      await window.hermesAPI.updateSessionPinned(id, pinned);
+      void refresh(true);
+    } catch (err) {
+      console.error("Failed to update session pin", id, err);
+      setSessions((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, pinned: !pinned } : s)),
+      );
+    }
+  }, [refresh]);
 
   const startRename = useCallback((s: RecentSession): void => {
     setEditingId(s.id);
@@ -563,6 +674,45 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     [],
   );
 
+  const handleToggleArchive = useCallback(
+    async (id: string): Promise<void> => {
+      const current = sessionsRef.current.find((s) => s.id === id);
+      if (!current) return;
+      const archived = !current.archived;
+      setSessions((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, archived } : s)),
+      );
+      try {
+        await window.hermesAPI.updateSessionArchived(id, archived);
+        void refresh(true);
+      } catch (err) {
+        console.error("Failed to update session archive state", id, err);
+        setSessions((prev) =>
+          prev.map((s) => (s.id === id ? { ...s, archived: !archived } : s)),
+        );
+      }
+    },
+    [refresh],
+  );
+
+  const handleSetWorkspace = useCallback(async (id: string): Promise<void> => {
+    const current = sessionsRef.current.find((s) => s.id === id);
+    const next = window.prompt("Agent workspace", current?.cwd ?? "");
+    if (next === null) return;
+    const cwd = next.trim();
+    if (!cwd) return;
+    const previous = current?.cwd ?? null;
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, cwd } : s)));
+    try {
+      await window.hermesAPI.updateSessionWorkspace(id, cwd);
+    } catch (err) {
+      console.error("Failed to update agent workspace", id, err);
+      setSessions((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, cwd: previous } : s)),
+      );
+    }
+  }, []);
+
   const handlePickNewFolder = useCallback(
     async (id: string): Promise<void> => {
       try {
@@ -579,12 +729,6 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     async (id: string): Promise<void> => {
       setDeleting(true);
       setSessions((prev) => prev.filter((s) => s.id !== id));
-      setPinnedIds((prev) => {
-        if (!prev.has(id)) return prev;
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
       try {
         await window.hermesAPI.deleteSession(id);
         onSessionDeleted?.(id);
@@ -605,6 +749,8 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
         id: s.id,
         title: s.title,
         contextFolder: s.contextFolder ?? null,
+        cwd: s.cwd ?? null,
+        archived: Boolean(s.archived),
         x,
         y,
       });
@@ -651,9 +797,11 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     project = false,
     visible = expanded,
     pinned = false,
+    subthread = false,
   ): React.JSX.Element => {
     const title = s.title || t("sessions.newConversation");
-    const loading = resumingSessionId === s.id || loadingSessionIds.has(s.id);
+    const loading =
+      resumingSessionId === s.id || loadingSessionIds.has(s.id) || Boolean(s.isWorking);
     const active = !loading && currentSessionId === s.id;
     const editing = editingId === s.id;
     const menuOpen = menuTarget?.id === s.id;
@@ -664,7 +812,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
           key={s.id}
           className={`sidebar-recent-session ${
             project ? "project-child" : ""
-          } editing`}
+          } ${subthread ? "subthread" : ""} editing`}
         >
           <input
             ref={renameInputRef}
@@ -697,8 +845,8 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
         role="button"
         tabIndex={visible ? 0 : -1}
         className={`sidebar-recent-session ${project ? "project-child" : ""} ${
-          active ? "active" : ""
-        } ${menuOpen ? "menu-open" : ""}`}
+          subthread ? "subthread" : ""
+        } ${active ? "active" : ""} ${menuOpen ? "menu-open" : ""}`}
         onClick={() => onSelect(s.id)}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -710,7 +858,9 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
           e.preventDefault();
           openMenuForSession(s, e.clientX, e.clientY);
         }}
-        title={title}
+        title={
+          loading && s.activityPhase ? `${title} — ${s.activityPhase}` : title
+        }
       >
         {loading ? (
           <Loader
@@ -748,6 +898,25 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
     );
   };
 
+  const renderSessionTree = (
+    session: RecentSession,
+    project = false,
+    visible = expanded,
+    pinned = false,
+    subthread = false,
+  ): React.JSX.Element => (
+    <div className="sidebar-recent-session-tree" key={session.id}>
+      {renderSessionButton(session, project, visible, pinned, subthread)}
+      {session.children && session.children.length > 0 && (
+        <div className="sidebar-recent-child-sessions">
+          {session.children.map((child) =>
+            renderSessionTree(child, false, visible, false, true),
+          )}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div
       className={`sidebar-recent-sessions-wrap ${expanded ? "expanded" : ""}`}
@@ -783,7 +952,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
             >
               <div className="sidebar-recent-collapse-inner">
                 {pinnedSessions.map((s) =>
-                  renderSessionButton(s, false, expanded && pinnedOpen, true),
+                  renderSessionTree(s, false, expanded && pinnedOpen, true),
                 )}
               </div>
             </div>
@@ -851,7 +1020,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
                       >
                         <div className="sidebar-recent-collapse-inner">
                           {group.sessions.map((s) =>
-                            renderSessionButton(s, true, visible),
+                            renderSessionTree(s, true, visible),
                           )}
                         </div>
                       </div>
@@ -889,7 +1058,7 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
             <div className="sidebar-recent-collapse-inner">
               {chats.length > 0 ? (
                 chats.map((s) =>
-                  renderSessionButton(s, false, expanded && chatsOpen),
+                  renderSessionTree(s, false, expanded && chatsOpen),
                 )
               ) : (
                 <div className="sidebar-recent-empty">
@@ -908,15 +1077,29 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
             <span>{t("common.loadingShort")}</span>
           </div>
         )}
+        {archivedSessions.length > 0 && (
+          <div className="sidebar-recent-section">
+            <div className="sidebar-recent-section-toggle" role="heading">
+              <span>Archived</span>
+            </div>
+            <div className="sidebar-recent-collapse expanded">
+              <div className="sidebar-recent-collapse-inner">
+                {attachSidebarChildSessions(archivedSessions).map((s) =>
+                  renderSessionTree(s, false, expanded),
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
       {expanded && menuTarget && (
         <SidebarSessionMenu
           target={menuTarget}
-          isPinned={pinnedIds.has(menuTarget.id)}
+          isPinned={Boolean(sessions.find((row) => row.id === menuTarget.id)?.pinned)}
           projects={projectChoices}
           scrollContainer={scrollRootRef.current}
           onClose={() => setMenuTarget(null)}
-          onTogglePin={() => handleTogglePin(menuTarget.id)}
+          onTogglePin={() => void handleTogglePin(menuTarget.id)}
           onRename={() => {
             const s = sessions.find((row) => row.id === menuTarget.id);
             if (s) startRename(s);
@@ -925,6 +1108,8 @@ const SidebarRecentSessions = memo(function SidebarRecentSessions({
             void handleMoveToProject(menuTarget.id, path)
           }
           onPickNewFolder={() => void handlePickNewFolder(menuTarget.id)}
+          onToggleArchive={() => void handleToggleArchive(menuTarget.id)}
+          onSetWorkspace={() => void handleSetWorkspace(menuTarget.id)}
           onDelete={() => setPendingDeleteId(menuTarget.id)}
         />
       )}

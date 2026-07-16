@@ -1852,6 +1852,16 @@ body {
   padding-left: 28px;
 }
 
+.sidebar-recent-child-sessions {
+  margin-left: 14px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border-color);
+}
+
+.sidebar-recent-session.subthread {
+  padding-left: 12px;
+}
+
 .sidebar-recent-session-dot {
   flex-shrink: 0;
   color: var(--text-muted);

@@ -4,6 +4,8 @@ import { AnimatePresence, motion } from "motion/react";
 import { useI18n } from "../../components/useI18n";
 import {
   Check,
+  Archive,
+  ArchiveRestore,
   ChevronRight,
   FolderInput,
   Pencil,
@@ -21,6 +23,8 @@ export interface SidebarMenuTarget {
   id: string;
   title: string;
   contextFolder: string | null;
+  cwd?: string | null;
+  archived?: boolean;
   /** Viewport coordinates the menu should anchor to (trigger / cursor). */
   x: number;
   y: number;
@@ -71,6 +75,8 @@ function SidebarSessionMenu({
   onRename,
   onMoveToProject,
   onPickNewFolder,
+  onToggleArchive,
+  onSetWorkspace,
   onDelete,
 }: {
   target: SidebarMenuTarget;
@@ -88,6 +94,8 @@ function SidebarSessionMenu({
   onRename: () => void;
   onMoveToProject: (path: string | null) => void;
   onPickNewFolder: () => void;
+  onToggleArchive: () => void;
+  onSetWorkspace: () => void;
   onDelete: () => void;
 }): React.JSX.Element {
   const { t } = useI18n();
@@ -207,6 +215,34 @@ function SidebarSessionMenu({
                           ? t("navigation.sessionMenu.unpin")
                           : t("navigation.sessionMenu.pin")}
                       </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="sidebar-session-menu-item"
+                      onClick={() => {
+                        onToggleArchive();
+                        requestClose();
+                      }}
+                    >
+                      {target.archived ? (
+                        <ArchiveRestore size={15} />
+                      ) : (
+                        <Archive size={15} />
+                      )}
+                      <span>{target.archived ? "Unarchive" : "Archive"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="sidebar-session-menu-item"
+                      onClick={() => {
+                        onSetWorkspace();
+                        requestClose();
+                      }}
+                    >
+                      <FolderInput size={15} />
+                      <span>Set agent workspace</span>
                     </button>
                     <button
                       type="button"

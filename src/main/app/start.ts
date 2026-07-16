@@ -8,6 +8,7 @@ import { stopAllDashboards } from "../dashboard";
 import { cleanupTempMediaFiles } from "../media";
 import { closeDbConnection } from "../db";
 import { stopSshTunnel } from "../ssh-tunnel";
+import { closeActiveSessionRevisionTracker } from "../session-revision";
 import {
   hardenAttachedWebContents,
   hardenWebviewPreferences,
@@ -113,6 +114,7 @@ export function startMainProcess(): void {
     // relaunch leaks another tunnel and the port drifts (18642 → 61799 → …).
     stopSshTunnel();
     closeDbConnection();
+    closeActiveSessionRevisionTracker();
   });
 }
 
@@ -164,6 +166,9 @@ function createWindow(): void {
       webSecurity: true,
       allowRunningInsecureContent: false,
       webviewTag: true,
+      // The session revision poll is intentionally active while the window is
+      // minimized so background Hermes/WebUI commits reach the sidebar cache.
+      backgroundThrottling: false,
     },
   });
 
