@@ -52,12 +52,14 @@ import { spawn } from "child_process";
 import {
   getApiServerKey,
   getConnectionConfig,
+  getConfigValue,
   getModelConfig,
   readEnv,
 } from "./config";
 import type { ConnectionConfig } from "./config";
 import { providerListSafe } from "./secrets";
 import {
+  reasoningEffortForProfile,
   sendMessage,
   shouldForceCliForSessionOverride,
   stopHealthPolling,
@@ -71,6 +73,20 @@ const mockedGetConnectionConfig = vi.mocked(getConnectionConfig);
 const mockedReadEnv = vi.mocked(readEnv);
 const mockedProviderListSafe = vi.mocked(providerListSafe);
 const mockedSpawn = vi.mocked(spawn);
+
+describe("reasoningEffortForProfile", () => {
+  afterEach(() => {
+    vi.mocked(getConfigValue).mockReturnValue(null);
+  });
+
+  it("passes max only to GPT-5.6 Sol models", () => {
+    vi.mocked(getConfigValue).mockReturnValue("max");
+
+    expect(reasoningEffortForProfile(undefined, "gpt-5.6-sol")).toBe("max");
+    expect(reasoningEffortForProfile(undefined, "gpt-5.6")).toBe("max");
+    expect(reasoningEffortForProfile(undefined, "gpt-5.5")).toBeNull();
+  });
+});
 
 function testConnection(
   fields: Partial<ConnectionConfig> = {},

@@ -1,10 +1,14 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Brain, Check, ChevronDown } from "lucide-react";
 import { useI18n } from "../../components/useI18n";
-import type { ReasoningEffort } from "./hooks/useReasoningEffort";
+import {
+  isGpt56SolModel,
+  type ReasoningEffort,
+} from "./hooks/useReasoningEffort";
 
 interface ReasoningEffortPickerProps {
   value: ReasoningEffort;
+  model?: string;
   onChange: (value: ReasoningEffort) => void | Promise<void>;
 }
 
@@ -45,8 +49,15 @@ const OPTIONS: Array<{
   },
 ];
 
+const MAX_OPTION = {
+  value: "max" as const,
+  labelKey: "chat.reasoningEffort.max",
+  descriptionKey: "chat.reasoningEffort.maxDescription",
+};
+
 export const ReasoningEffortPicker = memo(function ReasoningEffortPicker({
   value,
+  model,
   onChange,
 }: ReasoningEffortPickerProps): React.JSX.Element {
   const { t } = useI18n();
@@ -54,9 +65,14 @@ export const ReasoningEffortPicker = memo(function ReasoningEffortPicker({
   const [saveError, setSaveError] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
 
+  const options = useMemo(
+    () => (isGpt56SolModel(model) ? [...OPTIONS, MAX_OPTION] : OPTIONS),
+    [model],
+  );
+
   const selected = useMemo(
-    () => OPTIONS.find((option) => option.value === value) ?? OPTIONS[0],
-    [value],
+    () => options.find((option) => option.value === value) ?? options[0],
+    [options, value],
   );
 
   useEffect(() => {
@@ -123,7 +139,7 @@ export const ReasoningEffortPicker = memo(function ReasoningEffortPicker({
               {t("chat.reasoningEffort.saveError")}
             </div>
           )}
-          {OPTIONS.map((option) => {
+          {options.map((option) => {
             const active = option.value === value;
             return (
               <button

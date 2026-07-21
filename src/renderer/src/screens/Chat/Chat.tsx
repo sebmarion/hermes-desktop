@@ -347,7 +347,10 @@ function Chat({
     toggle: toggleFastMode,
     set: setFastTier,
   } = useFastMode(profile);
-  const { reasoningEffort, setReasoningEffort } = useReasoningEffort(profile);
+  const { reasoningEffort, setReasoningEffort } = useReasoningEffort(
+    profile,
+    chatCurrentModel,
+  );
 
   // Pre-send readiness — fail-open check that disables Send + shows
   // an inline banner when the desktop can predict that the gateway
@@ -1035,6 +1038,7 @@ function Chat({
                 onSelectModel={handleSelectModel}
               />
               <ReasoningEffortPicker
+                model={chatCurrentModel}
                 value={reasoningEffort}
                 onChange={setReasoningEffort}
               />

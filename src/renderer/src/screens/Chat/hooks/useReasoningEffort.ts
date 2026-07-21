@@ -6,17 +6,27 @@ export type ReasoningEffort =
   | "low"
   | "medium"
   | "high"
-  | "xhigh";
+  | "xhigh"
+  | "max";
 
 export const DEFAULT_REASONING_EFFORT: ReasoningEffort = "auto";
 
-export function normalizeReasoningEffort(value: unknown): ReasoningEffort {
+export function isGpt56SolModel(model?: string): boolean {
+  const normalized = (model || "").trim().toLowerCase();
+  return normalized === "gpt-5.6" || normalized === "gpt-5.6-sol";
+}
+
+export function normalizeReasoningEffort(
+  value: unknown,
+  model?: string,
+): ReasoningEffort {
   return value === "auto" ||
     value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh"
+    value === "xhigh" ||
+    (value === "max" && (!model || isGpt56SolModel(model)))
     ? value
     : DEFAULT_REASONING_EFFORT;
 }
@@ -26,7 +36,10 @@ interface UseReasoningEffortResult {
   setReasoningEffort: (next: ReasoningEffort) => Promise<void>;
 }
 
-export function useReasoningEffort(profile?: string): UseReasoningEffortResult {
+export function useReasoningEffort(
+  profile?: string,
+  model?: string,
+): UseReasoningEffortResult {
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>(
     DEFAULT_REASONING_EFFORT,
   );
@@ -42,7 +55,7 @@ export function useReasoningEffort(profile?: string): UseReasoningEffortResult {
       .getConfig("agent.reasoning_effort", profile)
       .then((value) => {
         if (!cancelled) {
-          const next = normalizeReasoningEffort(value);
+          const next = normalizeReasoningEffort(value, model);
           reasoningEffortRef.current = next;
           setReasoningEffortState(next);
         }
@@ -57,7 +70,7 @@ export function useReasoningEffort(profile?: string): UseReasoningEffortResult {
     return (): void => {
       cancelled = true;
     };
-  }, [profile]);
+  }, [model, profile]);
 
   const setReasoningEffort = useCallback(
     async (next: ReasoningEffort): Promise<void> => {

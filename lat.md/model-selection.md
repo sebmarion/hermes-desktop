@@ -22,6 +22,12 @@ The override is a `SessionModelOverride` (`{provider, model, baseUrl}`), not a b
 
 The picker builds it via [[src/renderer/src/screens/Chat/hooks/useModelConfig.ts#effectiveOverrideBaseUrl]], the same baseUrl rule `selectModel` applies (keep the URL only for `custom`/`ollama-cloud`; clear it for named providers that have a canonical base URL), so the session pick and a persisted save can't drift. It is threaded renderer → preload IPC → main `sendMessage` as `modelOverride`.
 
+## GPT-5.6 Sol Ultra reasoning
+
+The Chat reasoning picker exposes `Ultra` only for GPT-5.6 Sol (`gpt-5.6` or `gpt-5.6-sol`). It persists and sends the OpenAI wire value `max`; other models normalize a stale `max` setting back to `Auto` and never send it.
+
+[[src/renderer/src/screens/Chat/hooks/useReasoningEffort.ts#isGpt56SolModel]] owns the model check and [[src/renderer/src/screens/Chat/ReasoningEffortPicker.tsx#ReasoningEffortPicker]] owns the conditional option. Both legacy API and runs transports in [[src/main/hermes.ts]] apply the same model guard before adding `reasoning_effort` to a request.
+
 ## Desktop-only persistence
 
 The selected model/provider is saved in a desktop-owned table keyed by session id, without storing API keys.

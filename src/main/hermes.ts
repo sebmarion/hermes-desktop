@@ -1180,9 +1180,10 @@ export function contextFolderSystemMessage(
   };
 }
 
-function reasoningEffortForProfile(
+export function reasoningEffortForProfile(
   profile?: string,
-): "minimal" | "low" | "medium" | "high" | "xhigh" | null {
+  model?: string,
+): "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null {
   const value = (getConfigValue("agent.reasoning_effort", profile) || "")
     .trim()
     .toLowerCase();
@@ -1191,7 +1192,9 @@ function reasoningEffortForProfile(
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh"
+    value === "xhigh" ||
+    (value === "max" &&
+      ["gpt-5.6", "gpt-5.6-sol"].includes((model || "").trim().toLowerCase()))
     ? value
     : null;
 }
@@ -1232,7 +1235,7 @@ function sendMessageViaApi(
   const ctxSystem = contextFolderSystemMessage(contextFolder);
   if (ctxSystem) messages.unshift(ctxSystem);
 
-  const reasoningEffort = reasoningEffortForProfile(profile);
+  const reasoningEffort = reasoningEffortForProfile(profile, mc.model);
   const bodyObj: Record<string, unknown> = {
     model: mc.model || "hermes-agent",
     messages,
@@ -1630,7 +1633,7 @@ function sendMessageViaRuns(
     input: message,
     conversation_history: apiHistory(history),
   };
-  const reasoningEffort = reasoningEffortForProfile(profile);
+  const reasoningEffort = reasoningEffortForProfile(profile, mc.model);
   if (reasoningEffort) bodyObj.reasoning_effort = reasoningEffort;
   if (sessionId) bodyObj.session_id = sessionId;
   if (ctxSystem) bodyObj.instructions = ctxSystem.content;

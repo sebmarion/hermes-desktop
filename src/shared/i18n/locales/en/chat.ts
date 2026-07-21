@@ -31,6 +31,8 @@ export default {
     highDescription: "Deeper reasoning for complex work.",
     xhigh: "Max",
     xhighDescription: "Maximum reasoning depth when supported.",
+    max: "Ultra",
+    maxDescription: "Highest reasoning depth for GPT-5.6 Sol.",
   },
   emptyTitle: "How can I help you today?",
   emptyHint: "Ask me to write code, answer questions, search the web, and more",
