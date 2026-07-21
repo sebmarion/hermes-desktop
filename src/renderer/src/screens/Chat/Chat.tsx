@@ -18,7 +18,10 @@ import {
   effectiveOverrideBaseUrl,
 } from "./hooks/useModelConfig";
 import { useFastMode } from "./hooks/useFastMode";
-import { useReasoningEffort } from "./hooks/useReasoningEffort";
+import {
+  isGpt56SolModel,
+  useReasoningEffort,
+} from "./hooks/useReasoningEffort";
 import { useLocalCommands } from "./hooks/useLocalCommands";
 import {
   dashboardChatEnabledForConnection,
@@ -351,6 +354,8 @@ function Chat({
     profile,
     chatCurrentModel,
   );
+  const solUltraSelected =
+    reasoningEffort === "ultra" && isGpt56SolModel(chatCurrentModel);
 
   // Pre-send readiness — fail-open check that disables Send + shows
   // an inline banner when the desktop can predict that the gateway
@@ -693,20 +698,23 @@ function Chat({
     activeTurnRef,
     contextFolder,
     sessionModel: sessionModelOverride,
-    sendViaDashboard: dashboardTransport.enabled
-      ? dashboardTransport.sendMessage
-      : undefined,
+    sendViaDashboard:
+      dashboardTransport.enabled && !solUltraSelected
+        ? dashboardTransport.sendMessage
+        : undefined,
     execSlashViaDashboard: dashboardTransport.enabled
       ? dashboardTransport.execSlash
       : undefined,
-    runBackgroundViaDashboard: dashboardTransport.enabled
-      ? dashboardTransport.runBackground
-      : undefined,
+    runBackgroundViaDashboard:
+      dashboardTransport.enabled && !solUltraSelected
+        ? dashboardTransport.runBackground
+        : undefined,
     addAgentMessage,
     enqueueMessage,
-    abortDashboard: dashboardTransport.enabled
-      ? dashboardTransport.abort
-      : undefined,
+    abortDashboard:
+      dashboardTransport.enabled && !solUltraSelected
+        ? dashboardTransport.abort
+        : undefined,
   });
 
   // Stable ref to handleSend so the drain effect doesn't re-trigger on

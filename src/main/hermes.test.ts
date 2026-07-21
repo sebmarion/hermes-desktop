@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import http from "http";
+import type { AddressInfo } from "net";
+import type { RequestListener } from "http";
 
 // hermes.ts pulls in the full main-process import graph; mock the modules with
 // import-time side effects (installer → electron) and the two seams under
@@ -79,12 +82,208 @@ describe("reasoningEffortForProfile", () => {
     vi.mocked(getConfigValue).mockReturnValue(null);
   });
 
-  it("passes max only to GPT-5.6 Sol models", () => {
+  it("migrates legacy max and passes literal ultra only to Sol models", () => {
     vi.mocked(getConfigValue).mockReturnValue("max");
 
-    expect(reasoningEffortForProfile(undefined, "gpt-5.6-sol")).toBe("max");
-    expect(reasoningEffortForProfile(undefined, "gpt-5.6")).toBe("max");
+    expect(reasoningEffortForProfile(undefined, "gpt-5.6-sol")).toBe("ultra");
+    expect(reasoningEffortForProfile(undefined, "gpt-5.6")).toBe("ultra");
     expect(reasoningEffortForProfile(undefined, "gpt-5.5")).toBeNull();
+
+    vi.mocked(getConfigValue).mockReturnValue("ultra");
+    expect(reasoningEffortForProfile(undefined, "gpt-5.6-sol")).toBe("ultra");
+  });
+});
+
+describe("Sol Ultra API transport", () => {
+  const baseCapabilities = {
+    features: {
+      run_submission: true,
+      run_events_sse: true,
+      run_stop: true,
+      run_approval_response: true,
+      tool_progress_events: true,
+    },
+    endpoints: {
+      runs: { path: "/v1/runs" },
+      run_events: { path: "/v1/runs/{run_id}/events" },
+      run_approval: { path: "/v1/runs/{run_id}/approval" },
+      run_stop: { path: "/v1/runs/{run_id}/stop" },
+    },
+  };
+
+  async function listen(
+    handler: RequestListener,
+  ): Promise<{ url: string; close: () => Promise<void> }> {
+    const server = http.createServer(handler);
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as AddressInfo).port;
+    return {
+      url: `http://127.0.0.1:${port}`,
+      close: () =>
+        new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        ),
+    };
+  }
+
+  function configureRemoteSol(url: string): void {
+    mockedGetConnectionConfig.mockReturnValue(
+      testConnection({ mode: "remote", remoteUrl: url, apiKey: "test-key" }),
+    );
+    mockedGetModelConfig.mockReturnValue({
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+    } as ReturnType<typeof getModelConfig>);
+    vi.mocked(getConfigValue).mockReturnValue("ultra");
+  }
+
+  afterEach(() => {
+    vi.mocked(getConfigValue).mockReturnValue(null);
+    stopHealthPolling();
+  });
+
+  it("fails closed when the gateway does not advertise Sol Ultra", async () => {
+    const paths: string[] = [];
+    const server = await listen((req, res) => {
+      paths.push(req.url || "");
+      if (req.url === "/v1/capabilities") {
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(baseCapabilities));
+        return;
+      }
+      res.statusCode = 500;
+      res.end("unexpected fallback");
+    });
+    configureRemoteSol(server.url);
+
+    try {
+      const error = new Promise<string>((resolve) => {
+        void sendMessage("hello", {
+          onChunk: () => undefined,
+          onDone: () => undefined,
+          onError: resolve,
+        });
+      });
+      expect(await error).toMatch(/Ultra.*support/i);
+      expect(paths).toEqual(["/v1/capabilities"]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("sends the literal ultra request through /v1/runs", async () => {
+    let runBody: Record<string, unknown> | null = null;
+    const server = await listen((req, res) => {
+      if (req.url === "/v1/capabilities") {
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            ...baseCapabilities,
+            features: {
+              ...baseCapabilities.features,
+              request_scoped_reasoning_effort: true,
+              sol_ultra_reasoning: true,
+            },
+          }),
+        );
+        return;
+      }
+      if (req.url === "/v1/runs" && req.method === "POST") {
+        let raw = "";
+        req.on("data", (chunk) => (raw += chunk.toString()));
+        req.on("end", () => {
+          runBody = JSON.parse(raw) as Record<string, unknown>;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ run_id: "run_ultra", status: "started" }));
+        });
+        return;
+      }
+      if (req.url === "/v1/runs/run_ultra/events") {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.end(
+          'event: run.completed\ndata: {"event":"run.completed","output":"done"}\n\n',
+        );
+        return;
+      }
+      res.statusCode = 500;
+      res.end("unexpected request");
+    });
+    configureRemoteSol(server.url);
+
+    try {
+      const done = new Promise<void>((resolve, reject) => {
+        void sendMessage("hello", {
+          onChunk: () => undefined,
+          onDone: () => resolve(),
+          onError: (error) => reject(new Error(error)),
+        });
+      });
+      await done;
+      expect(runBody).toMatchObject({
+        model: "gpt-5.6-sol",
+        input: "hello",
+        reasoning_effort: "ultra",
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not fall back to chat completions when an Ultra run fails", async () => {
+    const paths: string[] = [];
+    const server = await listen((req, res) => {
+      paths.push(req.url || "");
+      if (req.url === "/v1/capabilities") {
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            ...baseCapabilities,
+            features: {
+              ...baseCapabilities.features,
+              request_scoped_reasoning_effort: true,
+              sol_ultra_reasoning: true,
+            },
+          }),
+        );
+        return;
+      }
+      if (req.url === "/v1/runs" && req.method === "POST") {
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ run_id: "run_failed", status: "started" }));
+        return;
+      }
+      if (req.url === "/v1/runs/run_failed/events") {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.end(
+          'event: run.failed\ndata: {"event":"run.failed","error":"app-server unavailable"}\n\n',
+        );
+        return;
+      }
+      res.statusCode = 500;
+      res.end("unexpected legacy fallback");
+    });
+    configureRemoteSol(server.url);
+
+    try {
+      const error = new Promise<string>((resolve) => {
+        void sendMessage("hello", {
+          onChunk: () => undefined,
+          onDone: () => undefined,
+          onError: resolve,
+        });
+      });
+      expect(await error).toMatch(/cannot fall back.*app-server unavailable/i);
+      expect(paths).toEqual([
+        "/v1/capabilities",
+        "/v1/runs",
+        "/v1/runs/run_failed/events",
+      ]);
+    } finally {
+      await server.close();
+    }
   });
 });
 

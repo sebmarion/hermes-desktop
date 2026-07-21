@@ -49,8 +49,8 @@ const OPTIONS: Array<{
   },
 ];
 
-const MAX_OPTION = {
-  value: "max" as const,
+const ULTRA_OPTION = {
+  value: "ultra" as const,
   labelKey: "chat.reasoningEffort.max",
   descriptionKey: "chat.reasoningEffort.maxDescription",
 };
@@ -66,7 +66,7 @@ export const ReasoningEffortPicker = memo(function ReasoningEffortPicker({
   const pickerRef = useRef<HTMLDivElement>(null);
 
   const options = useMemo(
-    () => (isGpt56SolModel(model) ? [...OPTIONS, MAX_OPTION] : OPTIONS),
+    () => (isGpt56SolModel(model) ? [...OPTIONS, ULTRA_OPTION] : OPTIONS),
     [model],
   );
 

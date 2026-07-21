@@ -24,9 +24,13 @@ The picker builds it via [[src/renderer/src/screens/Chat/hooks/useModelConfig.ts
 
 ## GPT-5.6 Sol Ultra reasoning
 
-The Chat reasoning picker exposes `Ultra` only for GPT-5.6 Sol (`gpt-5.6` or `gpt-5.6-sol`). It persists and sends the OpenAI wire value `max`; other models normalize a stale `max` setting back to `Auto` and never send it.
+The Chat reasoning picker exposes `Ultra` only for GPT-5.6 Sol (`gpt-5.6` or `gpt-5.6-sol`) and sends the literal request-scoped value `ultra`; it is not a display alias for `max`.
 
-[[src/renderer/src/screens/Chat/hooks/useReasoningEffort.ts#isGpt56SolModel]] owns the model check and [[src/renderer/src/screens/Chat/ReasoningEffortPicker.tsx#ReasoningEffortPicker]] owns the conditional option. Both legacy API and runs transports in [[src/main/hermes.ts]] apply the same model guard before adding `reasoning_effort` to a request.
+[[src/renderer/src/screens/Chat/hooks/useReasoningEffort.ts#isGpt56SolModel]] owns the model check and [[src/renderer/src/screens/Chat/ReasoningEffortPicker.tsx#ReasoningEffortPicker]] owns the conditional option. A legacy persisted `max` from the mislabeled implementation is migrated to `ultra` for Sol.
+
+Ultra bypasses the dashboard/TUI and legacy chat transports. [[src/main/run-stream.ts#supportsSolUltraReasoning]] requires the Agent capability handshake before [[src/main/hermes.ts]] submits `/v1/runs`; any missing capability, failed run, or unavailable gateway surfaces an error instead of lowering effort or falling back to CLI.
+
+Hermes Agent validates the request again, forces `codex_app_server`, disables provider fallback, and enables multi-agent for the app-server turn. Other models reject `ultra`, and raw Responses never receive it.
 
 ## Desktop-only persistence
 

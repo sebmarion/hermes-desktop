@@ -7,7 +7,7 @@ export type ReasoningEffort =
   | "medium"
   | "high"
   | "xhigh"
-  | "max";
+  | "ultra";
 
 export const DEFAULT_REASONING_EFFORT: ReasoningEffort = "auto";
 
@@ -25,10 +25,11 @@ export function normalizeReasoningEffort(
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh" ||
-    (value === "max" && (!model || isGpt56SolModel(model)))
+    value === "xhigh"
     ? value
-    : DEFAULT_REASONING_EFFORT;
+    : (value === "ultra" || value === "max") && isGpt56SolModel(model)
+      ? "ultra"
+      : DEFAULT_REASONING_EFFORT;
 }
 
 interface UseReasoningEffortResult {
@@ -58,6 +59,11 @@ export function useReasoningEffort(
           const next = normalizeReasoningEffort(value, model);
           reasoningEffortRef.current = next;
           setReasoningEffortState(next);
+          if (value === "max" && next === "ultra") {
+            void window.hermesAPI
+              .setConfig("agent.reasoning_effort", "ultra", profile)
+              .catch(() => undefined);
+          }
         }
       })
       .catch(() => {

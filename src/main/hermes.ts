@@ -69,6 +69,7 @@ import {
   runCompletedUsage,
   runEventReasoningText,
   supportsHermesRunsTransport,
+  supportsSolUltraReasoning,
   type HermesApiCapabilities,
 } from "./run-stream";
 import {
@@ -1183,20 +1184,30 @@ export function contextFolderSystemMessage(
 export function reasoningEffortForProfile(
   profile?: string,
   model?: string,
-): "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null {
+): "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra" | null {
   const value = (getConfigValue("agent.reasoning_effort", profile) || "")
     .trim()
     .toLowerCase();
+
+  if (
+    (value === "max" || value === "ultra") &&
+    ["gpt-5.6", "gpt-5.6-sol"].includes((model || "").trim().toLowerCase())
+  ) {
+    return "ultra";
+  }
 
   return value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh" ||
-    (value === "max" &&
-      ["gpt-5.6", "gpt-5.6-sol"].includes((model || "").trim().toLowerCase()))
+    value === "xhigh"
     ? value
     : null;
+}
+
+function failClosedChat(cb: ChatCallbacks, error: string): ChatHandle {
+  cb.onError(error);
+  return { abort: () => undefined };
 }
 
 function sendMessageViaApi(
@@ -1634,6 +1645,7 @@ function sendMessageViaRuns(
     conversation_history: apiHistory(history),
   };
   const reasoningEffort = reasoningEffortForProfile(profile, mc.model);
+  const requiresSolUltra = reasoningEffort === "ultra";
   if (reasoningEffort) bodyObj.reasoning_effort = reasoningEffort;
   if (sessionId) bodyObj.session_id = sessionId;
   if (ctxSystem) bodyObj.instructions = ctxSystem.content;
@@ -1671,8 +1683,14 @@ function sendMessageViaRuns(
     }
   }
 
-  function fallbackToChatCompletions(): void {
+  function fallbackToChatCompletions(reason?: string): void {
     if (finished || fallbackStarted) return;
+    if (requiresSolUltra) {
+      finish(
+        `Sol Ultra requires the Hermes /v1/runs app-server transport and cannot fall back. ${reason || "The run transport became unavailable."}`,
+      );
+      return;
+    }
     fallbackStarted = true;
     fallbackHandle = sendMessageViaApi(
       message,
@@ -1742,7 +1760,7 @@ function sendMessageViaRuns(
           ? raw.error
           : "Hermes run failed.";
       if (!hasContent) {
-        fallbackToChatCompletions();
+        fallbackToChatCompletions(err);
         return;
       }
       finish(err);
@@ -1759,7 +1777,9 @@ function sendMessageViaRuns(
       // flow and only appear after a response finishes. A run pauses before it
       // can finish, so fall back to the existing path instead of deadlocking
       // the user on a hidden approval request.
-      stopRunAndFallback();
+      fallbackToChatCompletions(
+        "The run requested an approval that this desktop transport cannot display.",
+      );
     }
   }
 
@@ -1818,7 +1838,11 @@ function sendMessageViaRuns(
     eventsReq.on("error", (err) => {
       if (err.name === "AbortError" || finished) return;
       if (!hasContent) {
-        stopRunAndFallback();
+        if (requiresSolUltra) {
+          finish(`Sol Ultra run event stream failed: ${err.message}`);
+        } else {
+          stopRunAndFallback();
+        }
         return;
       }
       finish(`Run event stream failed: ${err.message}`);
@@ -1826,7 +1850,11 @@ function sendMessageViaRuns(
     eventsReq.on("timeout", () => {
       eventsReq?.destroy();
       if (!hasContent) {
-        stopRunAndFallback();
+        if (requiresSolUltra) {
+          finish("Sol Ultra run event stream timed out.");
+        } else {
+          stopRunAndFallback();
+        }
         return;
       }
       finish("Run event stream timed out.");
@@ -1851,7 +1879,9 @@ function sendMessageViaRuns(
       });
       res.on("end", () => {
         if (res.statusCode !== 202 && res.statusCode !== 200) {
-          fallbackToChatCompletions();
+          fallbackToChatCompletions(
+            `The gateway rejected the Ultra run with HTTP ${res.statusCode || 0}.`,
+          );
           return;
         }
         try {
@@ -1861,7 +1891,7 @@ function sendMessageViaRuns(
           runId = "";
         }
         if (!runId) {
-          fallbackToChatCompletions();
+          fallbackToChatCompletions("The gateway did not return a run id.");
           return;
         }
         openEventStream(runId);
@@ -1870,11 +1900,11 @@ function sendMessageViaRuns(
   );
   startReq.on("error", (err) => {
     if (err.name === "AbortError" || finished) return;
-    fallbackToChatCompletions();
+    fallbackToChatCompletions(`The run request failed: ${err.message}`);
   });
   startReq.on("timeout", () => {
     startReq?.destroy();
-    fallbackToChatCompletions();
+    fallbackToChatCompletions("The run request timed out.");
   });
   startReq.write(bodyBuf);
   startReq.end();
@@ -2641,9 +2671,36 @@ async function sendMessageViaNonGatewayApi(
   contextFolder?: string,
   override?: SessionModelOverride,
 ): Promise<ChatHandle> {
+  const mc = effectiveModelConfig(profile, override);
+  const reasoningEffort = reasoningEffortForProfile(profile, mc.model);
+  const requiresSolUltra = reasoningEffort === "ultra";
   const approvalCommand = /^\/(?:approve|deny)\b/i.test(message.trim());
+  const capabilities = await getApiCapabilities(profile);
+  if (requiresSolUltra) {
+    if (!supportsSolUltraReasoning(capabilities)) {
+      return failClosedChat(
+        cb,
+        "Sol Ultra support is unavailable on this Hermes gateway. Update Hermes Agent and restart the gateway; no lower effort was used.",
+      );
+    }
+    if (attachments?.length || approvalCommand) {
+      return failClosedChat(
+        cb,
+        "Sol Ultra currently requires a text /v1/runs turn without attachments or approval commands; no lower effort was used.",
+      );
+    }
+    return sendMessageViaRuns(
+      message,
+      cb,
+      profile,
+      resumeSessionId,
+      history,
+      attachments,
+      contextFolder,
+      override,
+    );
+  }
   if (!attachments?.length && !approvalCommand) {
-    const capabilities = await getApiCapabilities(profile);
     if (supportsHermesRunsTransport(capabilities)) {
       return sendMessageViaRuns(
         message,
@@ -2681,6 +2738,9 @@ async function sendMessageViaBestApi(
   override?: SessionModelOverride,
 ): Promise<ChatHandle> {
   const approvalCommand = /^\/(?:approve|deny)\b/i.test(message.trim());
+  const mc = effectiveModelConfig(profile, override);
+  const requiresSolUltra =
+    reasoningEffortForProfile(profile, mc.model) === "ultra";
   // Skip the TUI gateway when a session-scoped model override is active — the
   // TUI gateway reads its model from config.yaml and has no per-request
   // override mechanism. The API path below already honours the override.
@@ -2689,7 +2749,8 @@ async function sendMessageViaBestApi(
     !isRemoteMode() &&
     !attachments?.length &&
     !approvalCommand &&
-    !override
+    !override &&
+    !requiresSolUltra
   ) {
     try {
       return await sendMessageViaTuiGateway(
@@ -2735,6 +2796,9 @@ async function sendMessageViaBestApiWithLocalRecovery(
   let sawOutput = false;
   let settled = false;
   let activeHandle: ChatHandle | null = null;
+  const mc = effectiveModelConfig(profile, override);
+  const requiresSolUltra =
+    reasoningEffortForProfile(profile, mc.model) === "ultra";
 
   const recoverAfterPartialOutput = (error: string): void => {
     if (aborted || retrying || settled) return;
@@ -2774,6 +2838,14 @@ async function sendMessageViaBestApiWithLocalRecovery(
         attachments,
         contextFolder,
         override,
+      );
+      return;
+    }
+
+    if (requiresSolUltra) {
+      settled = true;
+      cb.onError(
+        "Sol Ultra requires the Hermes /v1/runs app-server transport, but the local gateway could not be recovered; no lower effort was used.",
       );
       return;
     }
@@ -2897,11 +2969,16 @@ export async function sendMessage(
 
   const mc = getModelConfig(profile);
   const eff = effectiveModelConfig(profile, override);
+  const requiresSolUltra =
+    reasoningEffortForProfile(profile, eff.model) === "ultra";
   // Official upstream desktop hot-swaps the active gateway session with
   // `/model ... --provider ...` before attaching media and submitting. Our
   // renderer dashboard transport follows that path. The legacy CLI fallback is
   // kept only for text-only turns; it cannot preserve image/path attachments.
-  if (shouldForceCliForSessionOverride(mc, eff, override, attachments)) {
+  if (
+    !requiresSolUltra &&
+    shouldForceCliForSessionOverride(mc, eff, override, attachments)
+  ) {
     return sendMessageViaCli(
       message,
       cb,
@@ -2933,6 +3010,13 @@ export async function sendMessage(
       attachments,
       contextFolder,
       override,
+    );
+  }
+
+  if (requiresSolUltra) {
+    return failClosedChat(
+      cb,
+      "Sol Ultra requires a healthy Hermes /v1/runs app-server transport, but the local gateway is unavailable; no lower effort was used.",
     );
   }
 

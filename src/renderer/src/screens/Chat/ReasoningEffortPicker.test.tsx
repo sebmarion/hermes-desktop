@@ -17,29 +17,32 @@ import { ReasoningEffortPicker } from "./ReasoningEffortPicker";
 
 describe("ReasoningEffortPicker", () => {
   it("shows Ultra for GPT-5.6 Sol", () => {
+    const onChange = vi.fn();
     render(
       <ReasoningEffortPicker
         model="gpt-5.6-sol"
         value="auto"
-        onChange={vi.fn()}
+        onChange={onChange}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "chat.reasoningEffort.auto" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "chat.reasoningEffort.auto" }),
+    );
 
     expect(screen.getByText("chat.reasoningEffort.max")).toBeTruthy();
+    fireEvent.click(screen.getByText("chat.reasoningEffort.max"));
+    expect(onChange).toHaveBeenCalledWith("ultra");
   });
 
   it("does not show Ultra for other models", () => {
     render(
-      <ReasoningEffortPicker
-        model="gpt-5.5"
-        value="auto"
-        onChange={vi.fn()}
-      />,
+      <ReasoningEffortPicker model="gpt-5.5" value="auto" onChange={vi.fn()} />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "chat.reasoningEffort.auto" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "chat.reasoningEffort.auto" }),
+    );
 
     expect(screen.queryByText("chat.reasoningEffort.max")).toBeNull();
   });

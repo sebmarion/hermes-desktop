@@ -39,6 +39,16 @@ export function supportsHermesRunsTransport(
   );
 }
 
+export function supportsSolUltraReasoning(
+  capabilities: HermesApiCapabilities | null | undefined,
+): boolean {
+  return (
+    supportsHermesRunsTransport(capabilities) &&
+    boolFeature(capabilities, "request_scoped_reasoning_effort") &&
+    boolFeature(capabilities, "sol_ultra_reasoning")
+  );
+}
+
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
 }

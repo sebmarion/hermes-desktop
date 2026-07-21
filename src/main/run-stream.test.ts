@@ -5,6 +5,7 @@ import {
   runCompletedUsage,
   runEventReasoningText,
   supportsHermesRunsTransport,
+  supportsSolUltraReasoning,
 } from "./run-stream";
 
 describe("supportsHermesRunsTransport", () => {
@@ -72,6 +73,39 @@ describe("supportsHermesRunsTransport", () => {
           runs: { path: "/v1/runs" },
           run_events: { path: "/v1/runs/{run_id}/events" },
           run_stop: { path: "/v1/runs/{run_id}/stop" },
+        },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("supportsSolUltraReasoning", () => {
+  const capabilities = {
+    features: {
+      run_submission: true,
+      run_events_sse: true,
+      run_stop: true,
+      run_approval_response: true,
+      tool_progress_events: true,
+      request_scoped_reasoning_effort: true,
+      sol_ultra_reasoning: true,
+    },
+    endpoints: {
+      runs: { path: "/v1/runs" },
+      run_events: { path: "/v1/runs/{run_id}/events" },
+      run_approval: { path: "/v1/runs/{run_id}/approval" },
+      run_stop: { path: "/v1/runs/{run_id}/stop" },
+    },
+  };
+
+  it("requires both the exact runs transport and Ultra feature flags", () => {
+    expect(supportsSolUltraReasoning(capabilities)).toBe(true);
+    expect(
+      supportsSolUltraReasoning({
+        ...capabilities,
+        features: {
+          ...capabilities.features,
+          sol_ultra_reasoning: false,
         },
       }),
     ).toBe(false);
