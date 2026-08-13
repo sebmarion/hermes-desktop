@@ -40,6 +40,10 @@ import {
   setSessionModelOverride,
 } from "../session-model-override-store";
 import {
+  startLocalSessionActivity,
+  type LocalSessionActivityHandle,
+} from "../session-activity";
+import {
   materializeDataUrlToTemp,
   readMediaAsDataUrl,
   saveMedia,
@@ -119,10 +123,18 @@ import {
   resolvePendingClarify,
 } from "../hermes";
 import {
+  freshDashboardWebSocketUrl,
   getDashboardStatus,
   startDashboard,
   stopDashboard,
 } from "../dashboard";
+import {
+  clearRemoteOAuthSession,
+  connectionConfigAfterRemoteOAuthLogin,
+  openRemoteOAuthLogin,
+  probeRemoteAuthMode,
+  remoteOAuthSessionState,
+} from "../remote-oauth";
 import {
   startSshTunnel,
   ensureSshTunnel,
@@ -189,6 +201,9 @@ import {
   listCachedSessions,
   updateSessionTitle,
   type CachedSession,
+  updateSessionArchived,
+  updateSessionWorkspace,
+  updateSessionPinned,
 } from "../session-cache";
 import {
   remoteDeleteSession,
@@ -199,6 +214,9 @@ import {
   remoteReadMediaAsDataUrl,
   remoteSearchSessions,
   remoteUpdateSessionTitle,
+  remoteUpdateSessionArchived,
+  remoteUpdateSessionWorkspace,
+  remoteUpdateSessionPinned,
   type RemoteSessionConfig,
 } from "../remote-sessions";
 import {
@@ -256,6 +274,11 @@ import {
   listWallets,
   renameWallet,
 } from "../wallet-store";
+import {
+  listCustomProviders,
+  removeCustomProvider,
+  upsertCustomProvider,
+} from "../providers-store";
 import { syncWalletsForProfile } from "../wallet-sync";
 import { getWalletPortfolio, provisionAgentWallet } from "../wallet-actions";
 import { getTokenBalances } from "../wallet-balances";
@@ -377,6 +400,10 @@ import {
   sshGetPlatformEnabled,
   sshSetPlatformEnabled,
   sshListCachedSessions,
+  sshUpdateSessionArchived,
+  sshUpdateSessionTitle,
+  sshUpdateSessionWorkspace,
+  sshUpdateSessionPinned,
   sshRunDoctor,
   sshListModels,
   sshAddModel,
@@ -397,6 +424,7 @@ export interface IpcContext {
   ) => Promise<CachedSession[]>;
   notifyConnectionConfigChanged: () => void;
   notifyModelLibraryChanged: () => void;
+  notifyCustomProvidersChanged: () => void;
   openExternalUrl: (rawUrl: unknown) => void;
   requestSessionCacheSync: () => Promise<CachedSession[]>;
 }
@@ -559,6 +587,14 @@ async function withRemoteDashboard<T>(
   dashboardOperation: () => Promise<T>,
   legacyOperation: () => Promise<T> | T,
 ): Promise<T> {
+  if (conn.remoteAuthMode === "oauth") {
+    if (conn.remoteChatTransport === "legacy") {
+      throw new Error(
+        "Legacy remote transport cannot authenticate to an OAuth gateway.",
+      );
+    }
+    return dashboardOperation();
+  }
   if (conn.remoteChatTransport === "legacy") return legacyOperation();
   try {
     return await dashboardOperation();
@@ -661,10 +697,17 @@ export function registerIpcHandlers(context: IpcContext): void {
     listSessionCacheWindow,
     notifyConnectionConfigChanged,
     notifyModelLibraryChanged,
+    notifyCustomProvidersChanged,
     openExternalUrl,
     requestSessionCacheSync,
   } = context;
   const mainWindow = getMainWindow();
+  const localActivityHandles = new Map<string, LocalSessionActivityHandle>();
+
+  const stopLocalActivity = (runId: string): void => {
+    localActivityHandles.get(runId)?.stop();
+    localActivityHandles.delete(runId);
+  };
   // Installation
   ipcMain.handle("check-install", () => {
     return checkInstallStatus();
@@ -1219,6 +1262,8 @@ export function registerIpcHandlers(context: IpcContext): void {
         ...existing,
         mode,
         remoteUrl,
+        remoteAuthMode:
+          existing.remoteUrl === remoteUrl ? existing.remoteAuthMode : "auto",
         apiKey: resolveConnectionApiKeyUpdate(
           existing,
           mode,
@@ -1274,6 +1319,56 @@ export function registerIpcHandlers(context: IpcContext): void {
     "test-remote-connection",
     (_event, url: string, apiKey?: string) => testRemoteConnection(url, apiKey),
   );
+
+  ipcMain.handle("probe-remote-auth-mode", async (_event, url: string) => {
+    const result = await probeRemoteAuthMode(url);
+    const conn = getConnectionConfig();
+    if (
+      conn.mode === "remote" &&
+      conn.remoteUrl.trim() === url.trim() &&
+      conn.remoteAuthMode !== result.authMode
+    ) {
+      setConnectionConfig({ ...conn, remoteAuthMode: result.authMode });
+      notifyConnectionConfigChanged();
+    }
+    return result;
+  });
+
+  ipcMain.handle("remote-oauth-login", async () => {
+    const loginConfig = getConnectionConfig();
+    if (loginConfig.mode !== "remote" || !loginConfig.remoteUrl.trim()) {
+      throw new Error("Configure a Remote gateway URL before signing in.");
+    }
+    const result = await openRemoteOAuthLogin(
+      loginConfig.remoteUrl,
+      context.getMainWindow(),
+    );
+    setConnectionConfig(
+      connectionConfigAfterRemoteOAuthLogin(
+        loginConfig.remoteUrl,
+        getConnectionConfig(),
+      ),
+    );
+    notifyConnectionConfigChanged();
+    return result;
+  });
+
+  ipcMain.handle("remote-oauth-logout", async () => {
+    const conn = getConnectionConfig();
+    if (conn.mode !== "remote" || !conn.remoteUrl.trim()) {
+      throw new Error("Remote gateway is not configured.");
+    }
+    await clearRemoteOAuthSession(conn.remoteUrl);
+    return { signedIn: false };
+  });
+
+  ipcMain.handle("remote-oauth-session-state", () => {
+    const conn = getConnectionConfig();
+    if (conn.mode !== "remote" || !conn.remoteUrl.trim()) {
+      return { signedIn: false };
+    }
+    return remoteOAuthSessionState(conn.remoteUrl);
+  });
 
   ipcMain.handle(
     "test-ssh-connection",
@@ -1354,7 +1449,10 @@ export function registerIpcHandlers(context: IpcContext): void {
       // conversation). Sibling runs — other background sessions / agents —
       // keep streaming untouched.
       const existing = activeRuns.get(chatRunId);
-      if (existing) existing();
+      if (existing) {
+        existing();
+        stopLocalActivity(chatRunId);
+      }
 
       let fullResponse = "";
       const chatStartTime = Date.now();
@@ -1385,6 +1483,28 @@ export function registerIpcHandlers(context: IpcContext): void {
       };
       const abortThisRun = (): void => {
         activeRuns.get(chatRunId)?.();
+        stopLocalActivity(chatRunId);
+      };
+
+      let localActivitySessionId = "";
+      const setLocalActivity = (sessionId: string, phase: string): void => {
+        if (conn.mode !== "local") return;
+        const normalizedId = String(sessionId || "").trim();
+        if (!normalizedId) return;
+        const existingHandle = localActivityHandles.get(chatRunId);
+        if (existingHandle && localActivitySessionId === normalizedId) {
+          existingHandle.setPhase(phase);
+          return;
+        }
+        stopLocalActivity(chatRunId);
+        localActivitySessionId = normalizedId;
+        localActivityHandles.set(
+          chatRunId,
+          startLocalSessionActivity(normalizedId, chatRunId, {
+            profile,
+            phase,
+          }),
+        );
       };
 
       const handle = await sendMessage(
@@ -1406,9 +1526,11 @@ export function registerIpcHandlers(context: IpcContext): void {
             if (!safeSend("chat-reasoning-chunk", chunk)) {
               abortThisRun();
             }
+            setLocalActivity(localActivitySessionId, "thinking");
           },
           onDone: (sessionId) => {
             activeRuns.delete(chatRunId);
+            stopLocalActivity(chatRunId);
             try {
               persistPromptImageAttachments(sessionId, message, attachments);
             } catch (err) {
@@ -1436,10 +1558,12 @@ export function registerIpcHandlers(context: IpcContext): void {
             }
           },
           onSessionStarted: (sessionId) => {
+            setLocalActivity(sessionId, "running");
             safeSend("chat-session-started", sessionId);
           },
           onError: (error) => {
             activeRuns.delete(chatRunId);
+            stopLocalActivity(chatRunId);
             safeSend("chat-error", error);
             rejectChat(new Error(error));
             // Notify on error too if window not focused
@@ -1451,15 +1575,18 @@ export function registerIpcHandlers(context: IpcContext): void {
             }
           },
           onToolProgress: (tool) => {
+            setLocalActivity(localActivitySessionId, "tool");
             safeSend("chat-tool-progress", tool);
           },
           onToolEvent: (toolEvent) => {
+            setLocalActivity(localActivitySessionId, "tool");
             safeSend("chat-tool-event", toolEvent);
           },
           onUsage: (usage) => {
             safeSend("chat-usage", usage);
           },
           onClarify: (req) => {
+            setLocalActivity(localActivitySessionId, "clarification");
             safeSend("chat-clarify-request", req);
           },
         },
@@ -1481,9 +1608,13 @@ export function registerIpcHandlers(context: IpcContext): void {
     if (runId) {
       activeRuns.get(runId)?.();
       activeRuns.delete(runId);
+      stopLocalActivity(runId);
       return;
     }
-    for (const abort of activeRuns.values()) abort();
+    for (const [runId, abort] of activeRuns.entries()) {
+      abort();
+      stopLocalActivity(runId);
+    }
     activeRuns.clear();
   });
 
@@ -1667,6 +1798,9 @@ export function registerIpcHandlers(context: IpcContext): void {
   // the current chat path while we validate the ordered event stream.
   ipcMain.handle("dashboard-status", (_event, profile?: string) =>
     getDashboardStatus(profile),
+  );
+  ipcMain.handle("fresh-dashboard-ws-url", (_event, profile?: string) =>
+    freshDashboardWebSocketUrl(profile),
   );
   ipcMain.handle("start-dashboard", (_event, profile?: string) =>
     startDashboard(profile),
@@ -2047,6 +2181,33 @@ export function registerIpcHandlers(context: IpcContext): void {
     (_event, profile: string | undefined, id: string) =>
       deleteWallet(profile, id),
   );
+
+  // Custom (OpenAI-compatible) providers are desktop-local and profile-scoped.
+  // This store owns provider identity (name + base URL) so a configured
+  // provider renders as a card independent of whether a model is added yet; the
+  // key still lives in the profile `.env` and models in `models.json`.
+  ipcMain.handle("list-custom-providers", (_event, profile?: string) =>
+    listCustomProviders(profile),
+  );
+  ipcMain.handle(
+    "upsert-custom-provider",
+    (
+      _event,
+      profile: string | undefined,
+      input: { name: string; baseUrl: string },
+    ) => {
+      const record = upsertCustomProvider(profile, input);
+      notifyCustomProvidersChanged();
+      return record;
+    },
+  );
+  ipcMain.handle(
+    "remove-custom-provider",
+    (_event, profile: string | undefined, name: string) => {
+      removeCustomProvider(profile, name);
+      notifyCustomProvidersChanged();
+    },
+  );
   // Cloud wallets provisioned by the backend for the profile's linked agent.
   // Read-only here; the desktop no longer mints wallets locally.
   ipcMain.handle("wallet-sync", (_event, profile?: string) =>
@@ -2212,10 +2373,66 @@ export function registerIpcHandlers(context: IpcContext): void {
         return withSshDashboardSessions(
           conn,
           (config) => remoteUpdateSessionTitle(config, sessionId, title),
-          undefined,
+          () =>
+            sshUpdateSessionTitle(
+              conn.ssh!,
+              sessionId,
+              title,
+              activeSshProfile(),
+            ),
           activeSshProfile(),
         );
       return updateSessionTitle(sessionId, title);
+    },
+  );
+  ipcMain.handle(
+    "update-session-archived",
+    (_event, sessionId: string, archived: boolean) => {
+      const conn = getConnectionConfig();
+      if (conn.mode === "remote")
+        return remoteUpdateSessionArchived(conn, sessionId, Boolean(archived));
+      if (conn.mode === "ssh" && conn.ssh)
+        return withSshDashboardSessions(
+          conn,
+          (config) =>
+            remoteUpdateSessionArchived(config, sessionId, Boolean(archived)),
+          () =>
+            sshUpdateSessionArchived(conn.ssh!, sessionId, Boolean(archived)),
+        );
+      return updateSessionArchived(sessionId, Boolean(archived));
+    },
+  );
+  ipcMain.handle(
+    "update-session-workspace",
+    (_event, sessionId: string, cwd: string) => {
+      const normalized = typeof cwd === "string" ? cwd.trim() : "";
+      if (!normalized) throw new Error("Agent workspace must not be empty.");
+      const conn = getConnectionConfig();
+      if (conn.mode === "remote")
+        return remoteUpdateSessionWorkspace(conn, sessionId, normalized);
+      if (conn.mode === "ssh" && conn.ssh)
+        return withSshDashboardSessions(
+          conn,
+          (config) => remoteUpdateSessionWorkspace(config, sessionId, normalized),
+          () => sshUpdateSessionWorkspace(conn.ssh!, sessionId, normalized),
+        );
+      return updateSessionWorkspace(sessionId, normalized);
+    },
+  );
+  ipcMain.handle(
+    "update-session-pinned",
+    (_event, sessionId: string, pinned: boolean) => {
+      const conn = getConnectionConfig();
+      if (conn.mode === "remote")
+        return remoteUpdateSessionPinned(conn, sessionId, Boolean(pinned));
+      if (conn.mode === "ssh" && conn.ssh)
+        return withSshDashboardSessions(
+          conn,
+          (config) =>
+            remoteUpdateSessionPinned(config, sessionId, Boolean(pinned)),
+          () => sshUpdateSessionPinned(conn.ssh!, sessionId, Boolean(pinned)),
+        );
+      return updateSessionPinned(sessionId, Boolean(pinned));
     },
   );
 

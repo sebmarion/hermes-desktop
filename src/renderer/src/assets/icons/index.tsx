@@ -1,5 +1,7 @@
 export {
   ArrowRight,
+  Archive,
+  ArchiveRestore,
   Bot,
   Brain,
   Building,

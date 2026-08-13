@@ -1143,7 +1143,14 @@ export function useDashboardChatTransport({
           if (clientGenerationRef.current !== generation) {
             throw new Error("Hermes dashboard connection was superseded");
           }
-          if (!status.running || !status.connection?.wsUrl) {
+          if (!status.running || !status.connection) {
+            if (status.needsOAuthLogin) {
+              const error = new Error(
+                status.error || "Remote gateway sign-in is required",
+              ) as Error & { dashboardWasReachable?: boolean };
+              error.dashboardWasReachable = true;
+              throw error;
+            }
             // No dashboard on this remote (gateway-only install). Latch + notify
             // only in auto mode where we actually fall back to legacy.
             if (
@@ -1169,7 +1176,13 @@ export function useDashboardChatTransport({
             },
           });
           try {
-            await client.connect(status.connection.wsUrl);
+            const freshUrl = window.hermesAPI.freshDashboardWsUrl
+              ? await window.hermesAPI.freshDashboardWsUrl(profile)
+              : status.connection.wsUrl;
+            if (!freshUrl) {
+              throw new Error("Hermes dashboard WebSocket URL is unavailable");
+            }
+            await client.connect(freshUrl);
           } catch (err) {
             lastConnectErr = err;
             client.close();

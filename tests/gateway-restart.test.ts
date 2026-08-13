@@ -350,7 +350,9 @@ describe("restartGatewayViaCli", () => {
     healthStatuses.push(503, 200, 503, 503, 503, 200, 200, 200);
 
     const first = restartGatewayViaCli("work", 5, 1);
-    const second = restartGatewayViaCli("personal", 50, 1);
+    // The queued call must spawn a real child process after the first promise
+    // settles. Allow scheduler headroom under full-suite CPU load.
+    const second = restartGatewayViaCli("personal", 250, 1);
 
     await expect(Promise.all([first, second])).resolves.toEqual([false, true]);
     expect(hermesCliArgsSpy).toHaveBeenCalledTimes(2);

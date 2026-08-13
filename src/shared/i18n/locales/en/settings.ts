@@ -152,6 +152,21 @@ export default {
   remoteApiKey: "API Key",
   remoteApiKeyHint:
     "Matches API_SERVER_KEY on the remote host. Leave empty if the server accepts unauthenticated requests.",
+  remoteAuthDetecting:
+    "Authentication is detected automatically. Enter a token only for token-based gateways.",
+  remoteOAuthTitle: "Browser authentication",
+  remoteOAuthHint:
+    "This gateway uses OAuth. Sign in in the secure browser window to continue.",
+  remoteOAuthConnected: "Signed in to the remote gateway.",
+  remoteOAuthSignIn: "Sign in with browser",
+  remoteOAuthSignOut: "Sign out",
+  remoteOAuthWorking: "Working…",
+  remoteOAuthLoginSuccess: "Remote gateway sign-in complete.",
+  remoteOAuthLoginFailed: "Remote gateway sign-in failed.",
+  remoteOAuthCancelled: "Remote gateway sign-in cancelled.",
+  remoteOAuthLogoutSuccess: "Signed out from the remote gateway.",
+  remoteChatTransportHint:
+    "Auto detects token or OAuth dashboard authentication. OAuth never falls back to the legacy remote API when sign-in is missing or expired.",
   testingConnection: "Testing...",
   testConnection: "Test Connection",
   save: "Save",

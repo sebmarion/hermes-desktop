@@ -23,6 +23,10 @@ export default function ConnectionPane(): React.JSX.Element {
     connApiKey,
     setConnApiKey,
     connApiKeyMask,
+    remoteAuthMode,
+    setRemoteAuthMode,
+    remoteOAuthSignedIn,
+    remoteOAuthBusy,
     connTesting,
     apiServerKeyMissing,
     setApiServerKeyMissing,
@@ -43,6 +47,8 @@ export default function ConnectionPane(): React.JSX.Element {
     setSshRemotePort,
     handleSaveConnection,
     handleTestConnection,
+    handleRemoteOAuthLogin,
+    handleRemoteOAuthLogout,
     handleChatTransportChange,
     handleSwitchToLocal,
     handleSwitchToRemote,
@@ -147,14 +153,18 @@ export default function ConnectionPane(): React.JSX.Element {
       {connMode === "remote" && (
         <>
           <div className="settings-field">
-            <label className="settings-field-label">
+            <label className="settings-field-label" htmlFor="remote-url">
               {t("settings.remoteUrl")}
             </label>
             <input
+              id="remote-url"
               className="input"
               type="url"
               value={connRemoteUrl}
-              onChange={(e) => setConnRemoteUrl(e.target.value)}
+              onChange={(e) => {
+                setConnRemoteUrl(e.target.value);
+                setRemoteAuthMode("auto");
+              }}
               placeholder="http://192.168.1.100:8642"
               onBlur={handleSaveConnection}
             />
@@ -162,31 +172,67 @@ export default function ConnectionPane(): React.JSX.Element {
               {t("settings.remoteUrlHint")}
             </div>
           </div>
-          <div className="settings-field">
-            <label className="settings-field-label">
-              {t("settings.remoteApiKey")}
-            </label>
-            <input
-              className="input"
-              type="password"
-              value={connApiKey}
-              onChange={(e) => setConnApiKey(e.target.value)}
-              onFocus={(e) => {
-                if (connApiKey === connApiKeyMask) {
-                  e.currentTarget.select();
-                }
-              }}
-              placeholder={t("settings.remoteApiKey")}
-              onBlur={handleSaveConnection}
-            />
-            <div className="settings-field-hint">
-              {t("settings.remoteApiKeyHint")}
+          {remoteAuthMode === "oauth" ? (
+            <div className="settings-field">
+              <label className="settings-field-label">
+                {t("settings.remoteOAuthTitle")}
+              </label>
+              <div className="settings-field-hint">
+                {remoteOAuthSignedIn
+                  ? t("settings.remoteOAuthConnected")
+                  : t("settings.remoteOAuthHint")}
+              </div>
+              <div className="settings-hermes-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={remoteOAuthBusy}
+                  onClick={() =>
+                    void (remoteOAuthSignedIn
+                      ? handleRemoteOAuthLogout()
+                      : handleRemoteOAuthLogin())
+                  }
+                >
+                  {remoteOAuthBusy
+                    ? t("settings.remoteOAuthWorking")
+                    : remoteOAuthSignedIn
+                      ? t("settings.remoteOAuthSignOut")
+                      : t("settings.remoteOAuthSignIn")}
+                </button>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="settings-field">
+              <label className="settings-field-label" htmlFor="remote-api-key">
+                {t("settings.remoteApiKey")}
+              </label>
+              <input
+                id="remote-api-key"
+                className="input"
+                type="password"
+                value={connApiKey}
+                onChange={(e) => setConnApiKey(e.target.value)}
+                onFocus={(e) => {
+                  if (connApiKey === connApiKeyMask) {
+                    e.currentTarget.select();
+                  }
+                }}
+                placeholder={t("settings.remoteApiKey")}
+                onBlur={handleSaveConnection}
+              />
+              <div className="settings-field-hint">
+                {remoteAuthMode === "auto"
+                  ? t("settings.remoteAuthDetecting")
+                  : t("settings.remoteApiKeyHint")}
+              </div>
+            </div>
+          )}
           <div className="settings-field">
             <label className="settings-field-label">Chat transport</label>
             <div className="settings-theme-options">
-              {CHAT_TRANSPORT_OPTIONS.map((option) => (
+              {CHAT_TRANSPORT_OPTIONS.filter(
+                (option) => remoteAuthMode !== "oauth" || option !== "legacy",
+              ).map((option) => (
                 <button
                   key={option}
                   type="button"
@@ -202,9 +248,7 @@ export default function ConnectionPane(): React.JSX.Element {
               ))}
             </div>
             <div className="settings-field-hint">
-              Auto tries the Hermes dashboard WebSocket first, then falls back
-              to the legacy remote API. Dashboard requires the remote Hermes
-              dashboard URL and a valid dashboard session token.
+              {t("settings.remoteChatTransportHint")}
             </div>
             {transportProbe && (
               <div

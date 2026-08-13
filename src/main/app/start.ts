@@ -110,6 +110,7 @@ export function startMainProcess(): void {
     listSessionCacheWindow,
     notifyConnectionConfigChanged,
     notifyModelLibraryChanged,
+    notifyCustomProvidersChanged,
     openExternalUrl,
     requestSessionCacheSync: sessionRefreshCoordinator.request,
   });
@@ -195,6 +196,10 @@ function notifyConnectionConfigChanged(): void {
 
 function notifyModelLibraryChanged(): void {
   mainWindow?.webContents.send("model-library-changed");
+}
+
+function notifyCustomProvidersChanged(): void {
+  mainWindow?.webContents.send("custom-providers-changed");
 }
 
 function openExternalUrl(rawUrl: unknown): void {

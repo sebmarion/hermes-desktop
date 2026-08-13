@@ -41,11 +41,13 @@ export interface SshConnectionConfig {
 }
 
 export type RemoteChatTransport = "auto" | "dashboard" | "legacy";
+export type RemoteAuthMode = "auto" | "token" | "oauth";
 
 export interface ConnectionConfig {
   mode: "local" | "remote" | "ssh";
   remoteUrl: string;
   apiKey: string;
+  remoteAuthMode: RemoteAuthMode;
   remoteChatTransport: RemoteChatTransport;
   sshChatTransport: RemoteChatTransport;
   ssh: SshConnectionConfig;
@@ -54,6 +56,7 @@ export interface ConnectionConfig {
 export interface PublicConnectionConfig {
   mode: "local" | "remote" | "ssh";
   remoteUrl: string;
+  remoteAuthMode: RemoteAuthMode;
   remoteChatTransport: RemoteChatTransport;
   sshChatTransport: RemoteChatTransport;
   hasApiKey: boolean;
@@ -74,6 +77,10 @@ export function normalizeRemoteChatTransport(
   value: unknown,
 ): RemoteChatTransport {
   return value === "dashboard" || value === "legacy" ? value : "auto";
+}
+
+export function normalizeRemoteAuthMode(value: unknown): RemoteAuthMode {
+  return value === "token" || value === "oauth" ? value : "auto";
 }
 
 export function readDesktopConfig(): Record<string, unknown> {
@@ -100,6 +107,7 @@ export function getConnectionConfig(): ConnectionConfig {
     mode: (data.connectionMode as "local" | "remote" | "ssh") || "local",
     remoteUrl: (data.remoteUrl as string) || "",
     apiKey: (data.remoteApiKey as string) || "",
+    remoteAuthMode: normalizeRemoteAuthMode(data.remoteAuthMode),
     remoteChatTransport: normalizeRemoteChatTransport(data.remoteChatTransport),
     sshChatTransport: normalizeRemoteChatTransport(data.sshChatTransport),
     ssh: {
@@ -118,6 +126,7 @@ export function getPublicConnectionConfig(): PublicConnectionConfig {
   return {
     mode: config.mode,
     remoteUrl: config.remoteUrl,
+    remoteAuthMode: config.remoteAuthMode,
     remoteChatTransport: config.remoteChatTransport,
     sshChatTransport: config.sshChatTransport,
     hasApiKey: config.apiKey.length > 0,
@@ -135,6 +144,7 @@ export function setConnectionConfig(config: ConnectionConfig): void {
   if (config.mode === "remote" || config.apiKey.trim()) {
     data.remoteApiKey = config.apiKey;
   }
+  data.remoteAuthMode = normalizeRemoteAuthMode(config.remoteAuthMode);
   data.remoteChatTransport = normalizeRemoteChatTransport(
     config.remoteChatTransport,
   );

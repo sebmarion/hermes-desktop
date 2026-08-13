@@ -1,11 +1,14 @@
 import http from "http";
 import https from "https";
+import type { ConnectionConfig } from "./config";
+import { requestRemoteOAuthJson } from "./remote-oauth";
 import type { CachedSession } from "./session-cache";
 import {
   extractLeadingVisionImageFallback,
   stripTrailingImagePlaceholders,
 } from "./session-attachment-store";
 import {
+  dedupeSearchResultsBySession,
   expandRowsToHistory,
   type HistoryItem,
   type RawMessageRow,
@@ -14,6 +17,11 @@ import {
 } from "./sessions";
 import type { Attachment } from "../shared/attachments";
 import { isImageMime, MAX_IMAGE_BYTES } from "../shared/attachments";
+import {
+  buildCompressionLineageProjection,
+  projectCompressionLineages,
+  type CompressionLineageRow,
+} from "./session-lineage";
 
 export interface RemoteSessionConfig {
   remoteUrl: string;
@@ -67,10 +75,24 @@ export function dashboardApiUrl(
 }
 
 export function remoteRequestJson<T>(
-  config: RemoteSessionConfig,
+  config: RemoteSessionConfig | ConnectionConfig,
   path: string,
   options: RemoteRequestOptions = {},
 ): Promise<T> {
+  if ("mode" in config) {
+    if (config.mode !== "remote") {
+      throw new Error(
+        "Remote dashboard API is available only in direct Remote mode.",
+      );
+    }
+    if (config.remoteAuthMode === "oauth") {
+      return requestRemoteOAuthJson(
+        dashboardApiUrl(config, path),
+        options,
+      ) as Promise<T>;
+    }
+  }
+
   const token = config.apiKey.trim();
   if (!token)
     throw new Error("Remote Hermes dashboard token is not configured.");
@@ -221,65 +243,244 @@ function attachmentFromRemoteDataUrl(
   };
 }
 
-function sessionTitle(row: RemoteRecord, id: string): string {
-  return (
-    nullableString(row.title) ??
-    nullableString(row.preview) ??
-    `Session ${id.slice(-6)}`
-  );
+interface RemoteLineageFields {
+  id: string;
+  hasEndedAt: boolean;
+  parentSessionId?: string;
+  endReason?: string;
+  modelConfig?: string;
+  relationshipType?: string;
 }
 
-function normalizeSessionSummary(row: RemoteRecord): SessionSummary {
+function lineageFields(row: RemoteRecord): RemoteLineageFields {
   const id = stringValue(row.id, stringValue(row.session_id));
+  const parentSessionId = nullableString(
+    row.parent_session_id ?? row.parentSessionId,
+  );
+  const endReason = nullableString(row.end_reason ?? row.endReason);
+  const relationshipType = nullableString(
+    row.relationship_type ?? row.relationshipType,
+  );
+  const rawModelConfig = row.model_config ?? row.modelConfig;
+  const modelConfig =
+    typeof rawModelConfig === "string"
+      ? rawModelConfig
+      : rawModelConfig && typeof rawModelConfig === "object"
+        ? JSON.stringify(rawModelConfig)
+        : undefined;
+  const hasEndedAt =
+    Object.prototype.hasOwnProperty.call(row, "ended_at") ||
+    Object.prototype.hasOwnProperty.call(row, "endedAt");
   return {
     id,
-    source: stringValue(row.source, "chat"),
+    hasEndedAt,
+    ...(parentSessionId ? { parentSessionId } : {}),
+    ...(endReason ? { endReason } : {}),
+    ...(modelConfig ? { modelConfig } : {}),
+    ...(relationshipType ? { relationshipType } : {}),
+  };
+}
+
+function normalizeSessionSummary(
+  row: RemoteRecord,
+): SessionSummary & RemoteLineageFields {
+  const id = stringValue(row.id, stringValue(row.session_id));
+  const normalized = {
+    ...lineageFields(row),
+    id,
+    source: stringValue(row.source),
     startedAt: numberValue(
       row.started_at,
       numberValue(row.session_started, numberValue(row.last_active)),
     ),
-    endedAt: nullableNumber(row.ended_at),
+    endedAt: nullableNumber(row.ended_at ?? row.endedAt),
     messageCount: numberValue(row.message_count),
     model: stringValue(row.model),
     title: nullableString(row.title),
     preview: stringValue(row.preview),
-  };
-}
-
-function normalizeCachedSession(row: RemoteRecord): CachedSession {
-  const summary = normalizeSessionSummary(row);
-  return {
-    id: summary.id,
-    title: summary.title ?? sessionTitle(row, summary.id),
-    startedAt: summary.startedAt,
-    source: summary.source,
-    messageCount: summary.messageCount,
-    model: summary.model,
-    contextFolder: null,
-  };
+  } as SessionSummary & RemoteLineageFields;
+  if (Object.prototype.hasOwnProperty.call(row, "archived")) {
+    normalized.archived = Boolean(row.archived);
+  }
+  if (Object.prototype.hasOwnProperty.call(row, "pinned")) {
+    normalized.pinned = Boolean(row.pinned);
+  }
+  if (Object.prototype.hasOwnProperty.call(row, "cwd")) {
+    normalized.cwd = nullableString(row.cwd);
+  }
+  if (Object.prototype.hasOwnProperty.call(row, "last_activity_at")) {
+    normalized.lastActive = nullableNumber(row.last_activity_at);
+  }
+  if (row.is_working === true || row.isWorking === true) {
+    normalized.isWorking = true;
+    normalized.activityPhase = stringValue(
+      row.activity_phase ?? row.activityPhase,
+      "running",
+    );
+    normalized.activityStartedAt = numberValue(
+      row.activity_started_at,
+      numberValue(row.activityStartedAt),
+    );
+    normalized.activityHeartbeatAt = numberValue(
+      row.activity_heartbeat_at,
+      numberValue(row.activityHeartbeatAt),
+    );
+  }
+  return normalized;
 }
 
 function sessionsFromResponse(response: unknown): RemoteRecord[] {
   const record = asRecord(response);
-  return asArray(record.sessions);
+  const data = record.data;
+  if (Array.isArray(record.sessions)) return asArray(record.sessions);
+  if (Array.isArray(data)) return asArray(data);
+  return asArray(asRecord(data).sessions);
+}
+
+function hasLineageMetadata(rows: readonly RemoteRecord[]): boolean {
+  return rows.some((row) =>
+    [
+      "parent_session_id",
+      "parentSessionId",
+      "end_reason",
+      "endReason",
+      "model_config",
+      "modelConfig",
+      "relationship_type",
+      "relationshipType",
+    ].some((key) => Object.prototype.hasOwnProperty.call(row, key)),
+  );
+}
+
+type RemoteSessionEndpoint = "profiles" | "legacy";
+
+interface RemoteSessionListPage {
+  response: unknown;
+  endpoint: RemoteSessionEndpoint;
 }
 
 async function remoteSessionListPage(
   config: RemoteSessionConfig,
   limit: number,
   offset: number,
-): Promise<unknown> {
+  endpoint?: RemoteSessionEndpoint,
+  includeArchived = false,
+): Promise<RemoteSessionListPage> {
+  const archiveFilter = includeArchived ? "include" : "exclude";
   const profileEndpoint =
     `/api/profiles/sessions?limit=${limit}&offset=${offset}` +
-    "&min_messages=0&archived=exclude&order=recent&profile=all";
+    `&min_messages=0&archived=${archiveFilter}&order=recent&profile=all`;
+  const legacyEndpoint = `/api/sessions?limit=${limit}&offset=${offset}&archived=${archiveFilter}&order=recent`;
+
+  if (endpoint === "profiles") {
+    return {
+      response: await remoteRequestJson(config, profileEndpoint),
+      endpoint,
+    };
+  }
+  if (endpoint === "legacy") {
+    return {
+      response: await remoteRequestJson(config, legacyEndpoint),
+      endpoint,
+    };
+  }
 
   try {
-    return await remoteRequestJson(config, profileEndpoint);
+    return {
+      response: await remoteRequestJson(config, profileEndpoint),
+      endpoint: "profiles",
+    };
   } catch {
-    return remoteRequestJson(
+    return {
+      response: await remoteRequestJson(config, legacyEndpoint),
+      endpoint: "legacy",
+    };
+  }
+}
+
+const REMOTE_LINEAGE_PAGE_SIZE = 200;
+const MAX_REMOTE_LINEAGE_PAGES = 100;
+
+async function remoteLineageRows(
+  config: RemoteSessionConfig,
+  initialEndpoint?: RemoteSessionEndpoint,
+  includeArchived = false,
+): Promise<RemoteRecord[]> {
+  const rows: RemoteRecord[] = [];
+  const seenIds = new Set<string>();
+  let endpoint = initialEndpoint;
+
+  for (let page = 0; page < MAX_REMOTE_LINEAGE_PAGES; page += 1) {
+    const offset = page * REMOTE_LINEAGE_PAGE_SIZE;
+    const result = await remoteSessionListPage(
       config,
-      `/api/sessions?limit=${limit}&offset=${offset}&archived=exclude&order=recent`,
+      REMOTE_LINEAGE_PAGE_SIZE,
+      offset,
+      endpoint,
+      includeArchived,
     );
+    endpoint = result.endpoint;
+    const pageRows = sessionsFromResponse(result.response);
+    let added = 0;
+    for (const row of pageRows) {
+      const id = stringValue(row.id, stringValue(row.session_id));
+      if (!id || seenIds.has(id)) continue;
+      seenIds.add(id);
+      rows.push(row);
+      added += 1;
+    }
+    if (pageRows.length < REMOTE_LINEAGE_PAGE_SIZE || added === 0) break;
+  }
+
+  return rows;
+}
+
+async function remoteProjectedRows<T extends CompressionLineageRow>(
+  config: RemoteSessionConfig,
+  initialPage: RemoteSessionListPage,
+  normalize: (row: RemoteRecord) => T,
+  limit: number,
+  offset: number,
+  includeArchived = false,
+): Promise<T[]> {
+  const initialRows = sessionsFromResponse(initialPage.response);
+  // Offset zero without lineage keys is already a complete logical first page.
+  // Later physical pages must still scan globally because compressed segments
+  // on earlier pages may have consumed the requested logical offset.
+  if (offset === 0 && !hasLineageMetadata(initialRows)) {
+    return projectCompressionLineages(initialRows.map(normalize));
+  }
+  try {
+    const lineageRows = await remoteLineageRows(
+      config,
+      initialPage.endpoint,
+      includeArchived,
+    );
+    const initialIds = new Set(
+      initialRows
+        .map((row) => stringValue(row.id, stringValue(row.session_id)))
+        .filter(Boolean),
+    );
+    if (
+      initialIds.size > 0 &&
+      !lineageRows.some((row) =>
+        initialIds.has(stringValue(row.id, stringValue(row.session_id))),
+      )
+    ) {
+      return projectCompressionLineages(initialRows.map(normalize));
+    }
+    if (!hasLineageMetadata(lineageRows)) {
+      return projectCompressionLineages(initialRows.map(normalize));
+    }
+    return projectCompressionLineages(lineageRows.map(normalize)).slice(
+      offset,
+      offset + limit,
+    );
+  } catch {
+    // A partially upgraded endpoint may expose lineage keys on a page while
+    // rejecting the wider page size needed for global projection. Keep the
+    // initial page rather than mixing rows from a different API generation.
+    return projectCompressionLineages(initialRows.map(normalize));
   }
 }
 
@@ -287,18 +488,87 @@ export async function remoteListSessions(
   config: RemoteSessionConfig,
   limit = 30,
   offset = 0,
+  includeArchived = false,
 ): Promise<SessionSummary[]> {
-  const response = await remoteSessionListPage(config, limit, offset);
-  return sessionsFromResponse(response).map(normalizeSessionSummary);
+  const initialPage = await remoteSessionListPage(
+    config,
+    limit,
+    offset,
+    undefined,
+    includeArchived,
+  );
+  const projected = await remoteProjectedRows(
+    config,
+    initialPage,
+    normalizeSessionSummary,
+    limit,
+    offset,
+    includeArchived,
+  );
+  return projected.map(({ hasEndedAt: _hasEndedAt, ...summary }) => ({
+    ...summary,
+    source: summary.source || "chat",
+  }));
 }
 
 export async function remoteListCachedSessions(
   config: RemoteSessionConfig,
   limit = 50,
   offset = 0,
+  includeArchived = false,
 ): Promise<CachedSession[]> {
-  const response = await remoteSessionListPage(config, limit, offset);
-  return sessionsFromResponse(response).map(normalizeCachedSession);
+  const initialPage = await remoteSessionListPage(
+    config,
+    limit,
+    offset,
+    undefined,
+    includeArchived,
+  );
+  const projected = await remoteProjectedRows(
+    config,
+    initialPage,
+    normalizeSessionSummary,
+    limit,
+    offset,
+    includeArchived,
+  );
+  return projected.map((summary) => ({
+    id: summary.id,
+    title:
+      summary.title ??
+      (summary.preview.trim()
+        ? summary.preview
+        : `Session ${summary.id.slice(-6)}`),
+    startedAt: summary.startedAt,
+    ...(summary.hasEndedAt ? { endedAt: summary.endedAt } : {}),
+    source: summary.source,
+    messageCount: summary.messageCount,
+    model: summary.model,
+    contextFolder: null,
+    ...(summary.cwd !== undefined ? { cwd: summary.cwd ?? null } : {}),
+    ...(summary.archived !== undefined ? { archived: summary.archived } : {}),
+    ...(summary.pinned !== undefined ? { pinned: summary.pinned } : {}),
+    ...(summary.parentSessionId
+      ? { parentSessionId: summary.parentSessionId }
+      : {}),
+    ...(summary.relationshipType
+      ? { relationshipType: summary.relationshipType }
+      : {}),
+    ...(summary.endReason ? { endReason: summary.endReason } : {}),
+    ...(summary.modelConfig ? { modelConfig: summary.modelConfig } : {}),
+    ...(summary.lineageRootId ? { lineageRootId: summary.lineageRootId } : {}),
+    ...(summary.compressionSegmentCount
+      ? { compressionSegmentCount: summary.compressionSegmentCount }
+      : {}),
+    ...(summary.isWorking
+      ? {
+          isWorking: true,
+          activityPhase: summary.activityPhase,
+          activityStartedAt: summary.activityStartedAt,
+          activityHeartbeatAt: summary.activityHeartbeatAt,
+        }
+      : {}),
+  }));
 }
 
 export async function remoteSearchSessions(
@@ -313,7 +583,7 @@ export async function remoteSearchSessions(
     `/api/sessions/search?q=${encodeURIComponent(trimmed)}`,
   );
   const records = asArray(asRecord(response).results);
-  const results = records.slice(0, limit).map((row) => {
+  const results = records.map((row) => {
     const sessionId = stringValue(row.session_id, stringValue(row.id));
     return {
       sessionId,
@@ -329,16 +599,59 @@ export async function remoteSearchSessions(
     };
   });
 
-  const enriched = await enrichRemoteSearchResults(config, results);
-  if (enriched.length >= limit) return enriched.slice(0, limit);
+  const { results: enriched, summaries } = await enrichRemoteSearchResults(
+    config,
+    results,
+  );
+  const lineageAvailable =
+    hasLineageMetadata(records) ||
+    summaries.some(
+      (summary) =>
+        Boolean(summary.parentSessionId) ||
+        Boolean(summary.endReason) ||
+        Boolean(summary.modelConfig),
+    );
+  let canonicalResults = enriched;
+  if (enriched.length === 0) {
+    return remoteSearchRecentSessionMessages(config, trimmed, limit, new Set());
+  }
+  try {
+    const lineageRows = await remoteLineageRows(config);
+    if (lineageAvailable || hasLineageMetadata(lineageRows)) {
+      const lineage = buildCompressionLineageProjection(
+        lineageRows.map(normalizeSessionSummary),
+      );
+      canonicalResults = enriched.map((result) => {
+        const canonical = lineage.canonicalBySessionId.get(result.sessionId);
+        if (!canonical) return result;
+        return {
+          ...result,
+          sessionId: canonical.id,
+          title: canonical.title,
+          startedAt: canonical.startedAt,
+          source: canonical.source,
+          messageCount: canonical.messageCount,
+          model: canonical.model,
+        };
+      });
+    }
+  } catch {
+    // Older endpoints may expose partial lineage fields but no compatible
+    // full-list endpoint. Preserve their original search results.
+  }
+  canonicalResults = dedupeSearchResultsBySession(canonicalResults, limit);
+  if (canonicalResults.length >= limit) return canonicalResults;
 
   const fallback = await remoteSearchRecentSessionMessages(
     config,
     trimmed,
     limit,
-    new Set(enriched.map((result) => result.sessionId)),
+    new Set(canonicalResults.map((result) => result.sessionId)),
   );
-  return [...enriched, ...fallback].slice(0, limit);
+  return dedupeSearchResultsBySession(
+    [...canonicalResults, ...fallback],
+    limit,
+  );
 }
 
 async function remoteSearchRecentSessionMessages(
@@ -395,7 +708,7 @@ async function remoteSearchRecentSessionMessages(
 async function remoteGetSessionSummary(
   config: RemoteSessionConfig,
   sessionId: string,
-): Promise<SessionSummary | null> {
+): Promise<(SessionSummary & RemoteLineageFields) | null> {
   try {
     const response = await remoteRequestJson(
       config,
@@ -403,8 +716,9 @@ async function remoteGetSessionSummary(
       { timeoutMs: 8_000 },
     );
     const record = asRecord(response);
-    return record.id || record.session_id
-      ? normalizeSessionSummary(record)
+    const payload = asRecord(record.session ?? record.data ?? record);
+    return payload.id || payload.session_id
+      ? normalizeSessionSummary(payload)
       : null;
   } catch {
     return null;
@@ -414,13 +728,16 @@ async function remoteGetSessionSummary(
 async function enrichRemoteSearchResults(
   config: RemoteSessionConfig,
   results: SearchResult[],
-): Promise<SearchResult[]> {
+): Promise<{
+  results: SearchResult[];
+  summaries: Array<SessionSummary & RemoteLineageFields>;
+}> {
   const uniqueIds = Array.from(
     new Set(results.map((result) => result.sessionId).filter(Boolean)),
   );
-  if (uniqueIds.length === 0) return results;
+  if (uniqueIds.length === 0) return { results, summaries: [] };
 
-  const summaries = new Map<string, SessionSummary>();
+  const summaries = new Map<string, SessionSummary & RemoteLineageFields>();
   const CONCURRENCY = 5;
   for (let i = 0; i < uniqueIds.length; i += CONCURRENCY) {
     const chunk = uniqueIds.slice(i, i + CONCURRENCY);
@@ -432,18 +749,21 @@ async function enrichRemoteSearchResults(
     }
   }
 
-  return results.map((result) => {
-    const summary = summaries.get(result.sessionId);
-    if (!summary) return result;
-    return {
-      ...result,
-      title: result.title ?? summary.title,
-      startedAt: result.startedAt || summary.startedAt,
-      source: result.source || summary.source,
-      messageCount: summary.messageCount || result.messageCount,
-      model: result.model || summary.model,
-    };
-  });
+  return {
+    results: results.map((result) => {
+      const summary = summaries.get(result.sessionId);
+      if (!summary) return result;
+      return {
+        ...result,
+        title: result.title ?? summary.title,
+        startedAt: result.startedAt || summary.startedAt,
+        source: result.source || summary.source,
+        messageCount: summary.messageCount,
+        model: result.model || summary.model,
+      };
+    }),
+    summaries: Array.from(summaries.values()),
+  };
 }
 
 function toNumericMessageId(value: unknown, index: number): number {
@@ -483,7 +803,14 @@ export async function remoteGetSessionMessages(
     config,
     `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
   );
-  const rows = asArray(asRecord(response).messages).map(normalizeMessageRow);
+  const record = asRecord(response);
+  const data = record.data;
+  const rawRows = Array.isArray(record.messages)
+    ? record.messages
+    : Array.isArray(data)
+      ? data
+      : asRecord(data).messages;
+  const rows = asArray(rawRows).map(normalizeMessageRow);
   return hydrateRemotePromptImageAttachments(config, expandRowsToHistory(rows));
 }
 
@@ -549,19 +876,57 @@ export async function remoteReadMediaAsDataUrl(
   }
 }
 
-export async function remoteUpdateSessionTitle(
+export async function remoteUpdateSessionMetadata(
   config: RemoteSessionConfig,
   sessionId: string,
-  title: string,
+  fields: {
+    title?: string;
+    cwd?: string;
+    workspace?: string;
+    archived?: boolean;
+    pinned?: boolean;
+  },
 ): Promise<void> {
   await remoteRequestJson(
     config,
     `/api/sessions/${encodeURIComponent(sessionId)}`,
     {
       method: "PATCH",
-      body: { title },
+      body: fields,
     },
   );
+}
+
+export async function remoteUpdateSessionTitle(
+  config: RemoteSessionConfig,
+  sessionId: string,
+  title: string,
+): Promise<void> {
+  return remoteUpdateSessionMetadata(config, sessionId, { title });
+}
+
+export async function remoteUpdateSessionWorkspace(
+  config: RemoteSessionConfig,
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  return remoteUpdateSessionMetadata(config, sessionId, { cwd });
+}
+
+export async function remoteUpdateSessionArchived(
+  config: RemoteSessionConfig,
+  sessionId: string,
+  archived: boolean,
+): Promise<void> {
+  return remoteUpdateSessionMetadata(config, sessionId, { archived });
+}
+
+export async function remoteUpdateSessionPinned(
+  config: RemoteSessionConfig,
+  sessionId: string,
+  pinned: boolean,
+): Promise<void> {
+  return remoteUpdateSessionMetadata(config, sessionId, { pinned });
 }
 
 export async function remoteDeleteSession(

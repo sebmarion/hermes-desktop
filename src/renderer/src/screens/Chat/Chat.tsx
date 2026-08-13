@@ -109,6 +109,9 @@ interface ChatProps {
   onSessionIdChange?: (runId: string, sessionId: string | null) => void;
   /** Reports the first user message as a best-effort conversation title. */
   onTitleChange?: (runId: string, title: string) => void;
+  /** Resolved avatar/colour of `profile`, so idle agent avatars in the
+   *  transcript show the agent's profile picture instead of the loading gif. */
+  agentAppearance?: { color?: string | null; avatar?: string | null };
 }
 
 function Chat({
@@ -123,8 +126,20 @@ function Chat({
   onLoadingChange,
   onSessionIdChange,
   onTitleChange,
+  agentAppearance,
 }: ChatProps): React.JSX.Element {
   const { t } = useI18n();
+  // Identity + appearance of the agent this conversation is with. Passed to the
+  // transcript so idle avatars render the agent's profile picture (the loading
+  // gif is only shown while a turn is generating).
+  const agentAvatar = useMemo(
+    () => ({
+      name: profile ?? "default",
+      color: agentAppearance?.color,
+      avatar: agentAppearance?.avatar,
+    }),
+    [profile, agentAppearance?.color, agentAppearance?.avatar],
+  );
   const [messages, setMessages] = useState<ChatMessage[]>(
     initialMessages ?? [],
   );
@@ -252,6 +267,16 @@ function Chat({
     const loadConnectionConfig = async (): Promise<void> => {
       try {
         const conn = await window.hermesAPI.getConnectionConfig();
+        let remoteAuthMode = conn.remoteAuthMode ?? "auto";
+        if (conn.mode === "remote" && conn.remoteUrl.trim()) {
+          try {
+            remoteAuthMode = (
+              await window.hermesAPI.probeRemoteAuthMode(conn.remoteUrl)
+            ).authMode;
+          } catch {
+            // Keep stored transport choice when public status is unreachable.
+          }
+        }
         if (!cancelled) {
           setConnectionMode(conn.mode);
           setRemoteMode(conn.mode !== "local");
@@ -260,7 +285,9 @@ function Chat({
               ? "auto"
               : conn.mode === "ssh"
                 ? (conn.sshChatTransport ?? "auto")
-                : (conn.remoteChatTransport ?? "auto"),
+                : remoteAuthMode === "oauth"
+                  ? "dashboard"
+                  : (conn.remoteChatTransport ?? "auto"),
           );
         }
       } catch {
@@ -283,7 +310,9 @@ function Chat({
           ? "auto"
           : conn.mode === "ssh"
             ? (conn.sshChatTransport ?? "auto")
-            : (conn.remoteChatTransport ?? "auto"),
+            : conn.remoteAuthMode === "oauth"
+              ? "dashboard"
+              : (conn.remoteChatTransport ?? "auto"),
       );
     });
     return (): void => {
@@ -997,6 +1026,7 @@ function Chat({
               onApprove={actions.handleApprove}
               onDeny={actions.handleDeny}
               onClarifyResolved={handleClarifyResolved}
+              agentAvatar={agentAvatar}
             />
           )}
           <div ref={bottomRef} />
