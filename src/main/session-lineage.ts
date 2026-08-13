@@ -175,7 +175,7 @@ function mergeRootFallbacks<T extends CompressionLineageRow>(
   if (!tip.cwd && root.cwd) merged.cwd = root.cwd;
   if (tip.archived == null && root.archived != null)
     merged.archived = root.archived;
-  if (Boolean(root.pinned) && !Boolean(tip.pinned)) merged.pinned = true;
+  if (root.pinned && !tip.pinned) merged.pinned = true;
   return merged;
 }
 
